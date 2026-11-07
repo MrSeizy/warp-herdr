@@ -4153,3 +4153,966 @@ fn test_undo_close_keeps_a_file_pane_watching_its_file() {
         });
     });
 }
+
+#[test]
+fn test_herdr_pane_ids_add_and_remove() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let pane_id = get_newly_created_pane_id(panes, &[]);
+            assert!(!panes.herdr_has_pane("herdr-1"));
+            assert_eq!(panes.herdr_pane_id_of(pane_id), None);
+
+            panes.herdr_pane_ids.insert("herdr-1".to_string(), pane_id);
+            assert!(panes.herdr_has_pane("herdr-1"));
+            assert_eq!(panes.herdr_pane_id_of(pane_id), Some("herdr-1"));
+
+            // herdr_close_pane drops the mapping along with the pane.
+            panes.herdr_close_pane("herdr-1", ctx);
+            assert!(!panes.herdr_has_pane("herdr-1"));
+            assert_eq!(panes.herdr_pane_id_of(pane_id), None);
+        });
+    });
+}
+
+#[test]
+fn test_herdr_set_pane_label_sets_and_clears_custom_vertical_tabs_title() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let pane_id = get_newly_created_pane_id(panes, &[]);
+            panes.register_herdr_pane_for_test("herdr-1", pane_id);
+
+            panes.herdr_set_pane_label("missing", Some("ignored"), ctx);
+            assert_eq!(
+                panes
+                    .pane_by_id(pane_id)
+                    .unwrap()
+                    .pane_configuration()
+                    .as_ref(ctx)
+                    .custom_vertical_tabs_title(),
+                None
+            );
+
+            panes.herdr_set_pane_label("herdr-1", Some("  build  "), ctx);
+            assert_eq!(
+                panes
+                    .pane_by_id(pane_id)
+                    .unwrap()
+                    .pane_configuration()
+                    .as_ref(ctx)
+                    .custom_vertical_tabs_title(),
+                Some("build")
+            );
+
+            panes.herdr_set_pane_label("herdr-1", None, ctx);
+            assert_eq!(
+                panes
+                    .pane_by_id(pane_id)
+                    .unwrap()
+                    .pane_configuration()
+                    .as_ref(ctx)
+                    .custom_vertical_tabs_title(),
+                None
+            );
+        });
+    });
+}
+
+#[test]
+fn test_herdr_generated_title_updates_beneath_custom_label() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let pane_id = get_newly_created_pane_id(panes, &[]);
+            panes.register_herdr_pane_for_test("herdr-1", pane_id);
+
+            panes.herdr_set_pane_title("herdr-1", "old", ctx);
+            panes.herdr_set_pane_label("herdr-1", Some("manual"), ctx);
+            panes.herdr_set_pane_title("herdr-1", "latest", ctx);
+
+            let configuration = panes
+                .pane_by_id(pane_id)
+                .unwrap()
+                .pane_configuration()
+                .as_ref(ctx);
+            assert_eq!(configuration.title(), "latest");
+            assert_eq!(configuration.custom_vertical_tabs_title(), Some("manual"));
+
+            panes.herdr_set_pane_label("herdr-1", None, ctx);
+            let configuration = panes
+                .pane_by_id(pane_id)
+                .unwrap()
+                .pane_configuration()
+                .as_ref(ctx);
+            assert_eq!(configuration.title(), "latest");
+            assert_eq!(configuration.custom_vertical_tabs_title(), None);
+        });
+    });
+}
+
+#[test]
+fn test_herdr_split_pane_dedupes_tracked_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let pane_id = get_newly_created_pane_id(panes, &[]);
+            panes.herdr_pane_ids.insert("herdr-1".to_string(), pane_id);
+
+            let spec = crate::herdr::fake_herdr::test_stream_spec("herdr", "");
+            let (tx, _rx) = async_channel::unbounded();
+            // A repeated pane_created for an already-tracked id must no-op:
+            // no new pane, and the existing mapping is left alone.
+            panes.herdr_split_pane(
+                "herdr-1",
+                Some("/tmp".to_string()),
+                Some("claude".to_string()),
+                crate::herdr::protocol::AgentStatus::Idle,
+                &spec,
+                &tx,
+                false,
+                ctx,
+            );
+
+            assert_eq!(panes.pane_count(), 1);
+            assert_eq!(panes.herdr_pane_ids.len(), 1);
+            assert_eq!(panes.herdr_pane_id_of(pane_id), Some("herdr-1"));
+        });
+    });
+}
+
+#[test]
+fn test_herdr_context_menu_split_does_not_create_local_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let pane_id = get_newly_created_pane_id(panes, &[]);
+            panes.herdr_pane_ids.insert("herdr-1".to_string(), pane_id);
+
+            panes.handle_pane_event(pane_id, &PaneEvent::SplitRight(None), ctx);
+
+            assert_eq!(
+                panes.pane_count(),
+                1,
+                "a context-menu split for a mirrored pane must be created by herdr"
+            );
+            assert_eq!(panes.herdr_pane_id_of(pane_id), Some("herdr-1"));
+        });
+    });
+}
+
+#[test]
+fn test_close_pane_removes_herdr_mapping_and_closes_for_real() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            // Even with undo-close enabled, a mirrored pane must not be
+            // hidden for undo: its herdr-side counterpart is destroyed by the
+            // routed close.
+            let _undo_close = FeatureFlag::UndoClosedPanes.override_enabled(true);
+
+            let first_pane_id = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second_pane_id = get_newly_created_pane_id(panes, &[first_pane_id]);
+            panes
+                .herdr_pane_ids
+                .insert("herdr-2".to_string(), second_pane_id);
+
+            // A user-initiated close drops the mapping (the reconciler
+            // suppresses the echo, so herdr_close_pane never runs) and closes
+            // the pane for real rather than hiding it for undo.
+            panes.close_pane(second_pane_id, ctx);
+
+            assert!(!panes.herdr_has_pane("herdr-2"));
+            assert!(!panes.has_pane_id(second_pane_id));
+            assert!(panes.has_pane_id(first_pane_id));
+        });
+    });
+}
+
+/// herdr-initiated closes (herdr_close_pane) must destroy the local pane for
+/// real even with undo-close enabled: the herdr-side pane is already gone,
+/// so an undo-hidden ghost would resurrect a dead mirror, and the hidden
+/// pane would make sync_herdr_layout's hidden-pane guard skip the group
+/// forever.
+#[test]
+fn test_herdr_close_pane_bypasses_undo_hide() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let _undo_close = FeatureFlag::UndoClosedPanes.override_enabled(true);
+
+            let first_pane_id = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second_pane_id = get_newly_created_pane_id(panes, &[first_pane_id]);
+            panes
+                .herdr_pane_ids
+                .insert("herdr-2".to_string(), second_pane_id);
+
+            panes.herdr_close_pane("herdr-2", ctx);
+
+            assert!(!panes.herdr_has_pane("herdr-2"));
+            // Destroyed, not hidden-for-close: undo must have nothing to
+            // restore.
+            assert!(!panes.has_pane_id(second_pane_id));
+            assert!(panes.has_pane_id(first_pane_id));
+        });
+    });
+}
+
+fn herdr_leaf(pane_id: &str) -> HerdrPaneTree {
+    HerdrPaneTree::Leaf {
+        pane_id: pane_id.to_string(),
+        cwd: None,
+        agent: None,
+        agent_status: crate::herdr::protocol::AgentStatus::Unknown,
+    }
+}
+
+fn herdr_split(
+    direction: HerdrSplitDirection,
+    ratio: f32,
+    first: HerdrPaneTree,
+    second: HerdrPaneTree,
+) -> HerdrPaneTree {
+    HerdrPaneTree::Split {
+        direction,
+        children: Box::new([(ratio, first), (1.0 - ratio, second)]),
+    }
+}
+
+fn herdr_test_spec(herdr_bin: &std::path::Path) -> HerdrStreamSpec {
+    crate::herdr::fake_herdr::test_stream_spec(herdr_bin, "")
+}
+
+/// Writes a fake `herdr` that stays alive without emitting frames, so
+/// `HerdrStream::spawn` succeeds and new panes register as herdr-attached.
+/// The subprocess is SIGKILLed when the pane's stream drops at test teardown.
+#[cfg(unix)]
+fn fake_herdr_bin(dir: &std::path::Path) -> std::path::PathBuf {
+    crate::herdr::fake_herdr::write_executable_herdr_script(dir, "#!/bin/sh\nsleep 10000\n")
+}
+
+/// Registers `pane_ids` as herdr-mirrored panes `herdr-1`, `herdr-2`, ... in
+/// order, mirroring how the tests seed herdr-bound groups by hand.
+fn register_herdr_panes(panes: &mut PaneGroup, pane_ids: &[PaneId]) {
+    for (idx, pane_id) in pane_ids.iter().enumerate() {
+        panes
+            .herdr_pane_ids
+            .insert(format!("herdr-{}", idx + 1), *pane_id);
+    }
+}
+
+fn expect_branch(node: &PaneNode) -> &tree::PaneBranch {
+    match node {
+        PaneNode::Branch(branch) => branch,
+        PaneNode::Leaf(_) => panic!("expected a branch node"),
+    }
+}
+
+fn expect_leaf(node: &PaneNode) -> PaneId {
+    match node {
+        PaneNode::Leaf(id) => *id,
+        PaneNode::Branch(_) => panic!("expected a leaf node"),
+    }
+}
+
+#[test]
+fn test_sync_herdr_layout_applies_ratio_and_axis() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let first = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second = get_newly_created_pane_id(panes, &[first]);
+            register_herdr_panes(panes, &[first, second]);
+            // Local divergence: the user dragged the mirrored split's
+            // divider; herdr's layout is the authority that corrects it.
+            match &mut panes.panes.root {
+                PaneNode::Branch(branch) => {
+                    branch.nodes[0].0 = PaneFlex(0.9);
+                    branch.nodes[1].0 = PaneFlex(0.1);
+                }
+                PaneNode::Leaf(_) => panic!("expected a branch root"),
+            }
+            panes.focus_pane(second, false, ctx);
+
+            // herdr reports the same two panes stacked vertically at 25/75.
+            let tree = herdr_split(
+                HerdrSplitDirection::Down,
+                0.25,
+                herdr_leaf("herdr-1"),
+                herdr_leaf("herdr-2"),
+            );
+            let (tx, _rx) = async_channel::unbounded();
+            panes.sync_herdr_layout(
+                &tree,
+                &herdr_test_spec(std::path::Path::new("herdr")),
+                &tx,
+                false,
+                ctx,
+            );
+
+            assert_eq!(panes.pane_count(), 2);
+            let root = expect_branch(&panes.panes.root);
+            assert_eq!(root.axis(), SplitDirection::Vertical);
+            assert_eq!(root.nodes.len(), 2);
+            let (flex, node) = &root.nodes[0];
+            assert_eq!(flex.0, 0.25);
+            assert_eq!(expect_leaf(node), first);
+            let (flex, node) = &root.nodes[1];
+            assert_eq!(flex.0, 0.75);
+            assert_eq!(expect_leaf(node), second);
+            // The live views were reused, not recreated, and the focused
+            // pane kept focus.
+            assert_eq!(panes.herdr_pane_id_of(first), Some("herdr-1"));
+            assert_eq!(panes.herdr_pane_id_of(second), Some("herdr-2"));
+            assert_eq!(panes.focused_pane_id(ctx), second);
+        });
+    });
+}
+
+#[test]
+fn test_sync_herdr_layout_nests_root_right_inserted_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let first = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second = get_newly_created_pane_id(panes, &[first]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let third = get_newly_created_pane_id(panes, &[first, second]);
+            register_herdr_panes(panes, &[first, second, third]);
+            // Local state mirrors herdr_split_pane's incremental insert: the
+            // third pane landed flat at the root on the right, while herdr
+            // nests it under the second.
+            let tree = herdr_split(
+                HerdrSplitDirection::Right,
+                0.5,
+                herdr_leaf("herdr-1"),
+                herdr_split(
+                    HerdrSplitDirection::Down,
+                    0.5,
+                    herdr_leaf("herdr-2"),
+                    herdr_leaf("herdr-3"),
+                ),
+            );
+            let (tx, _rx) = async_channel::unbounded();
+            panes.sync_herdr_layout(
+                &tree,
+                &herdr_test_spec(std::path::Path::new("herdr")),
+                &tx,
+                false,
+                ctx,
+            );
+
+            assert_eq!(panes.pane_count(), 3);
+            let root = expect_branch(&panes.panes.root);
+            assert_eq!(root.axis(), SplitDirection::Horizontal);
+            assert_eq!(root.nodes.len(), 2);
+            assert_eq!(expect_leaf(&root.nodes[0].1), first);
+            let nested = expect_branch(&root.nodes[1].1);
+            assert_eq!(nested.axis(), SplitDirection::Vertical);
+            let (flex, node) = &nested.nodes[0];
+            assert_eq!(flex.0, 0.5);
+            assert_eq!(expect_leaf(node), second);
+            let (flex, node) = &nested.nodes[1];
+            assert_eq!(flex.0, 0.5);
+            assert_eq!(expect_leaf(node), third);
+        });
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn test_sync_herdr_layout_creates_new_herdr_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+        let dir = tempfile::tempdir().unwrap();
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let first = get_newly_created_pane_id(panes, &[]);
+            register_herdr_panes(panes, &[first]);
+
+            // herdr reports a pane this group has never seen; the sync
+            // materializes and registers it.
+            let tree = herdr_split(
+                HerdrSplitDirection::Right,
+                0.5,
+                herdr_leaf("herdr-1"),
+                herdr_leaf("herdr-2"),
+            );
+            let spec = herdr_test_spec(&fake_herdr_bin(dir.path()));
+            let (tx, _rx) = async_channel::unbounded();
+            panes.sync_herdr_layout(&tree, &spec, &tx, false, ctx);
+
+            assert_eq!(panes.pane_count(), 2);
+            assert!(panes.herdr_has_pane("herdr-2"));
+            let root = expect_branch(&panes.panes.root);
+            assert_eq!(expect_leaf(&root.nodes[0].1), first);
+            let new_pane = expect_leaf(&root.nodes[1].1);
+            assert_ne!(new_pane, first);
+            assert!(panes.has_pane_id(new_pane));
+            assert_eq!(panes.herdr_pane_id_of(new_pane), Some("herdr-2"));
+        });
+    });
+}
+
+#[test]
+fn test_sync_herdr_layout_closes_leftover_pane_for_real() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            // Undo-close must not intercept the sync's close: the pane is
+            // gone herdr-side, so hiding it for undo would resurrect a dead
+            // mirror.
+            let _undo_close = FeatureFlag::UndoClosedPanes.override_enabled(true);
+
+            let first = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second = get_newly_created_pane_id(panes, &[first]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let third = get_newly_created_pane_id(panes, &[first, second]);
+            register_herdr_panes(panes, &[first, second, third]);
+            panes.focus_pane(third, false, ctx);
+
+            // herdr reports herdr-3 gone. Its mapping is removed before the
+            // close, so no close is routed back to herdr.
+            let tree = herdr_split(
+                HerdrSplitDirection::Right,
+                0.5,
+                herdr_leaf("herdr-1"),
+                herdr_leaf("herdr-2"),
+            );
+            let (tx, _rx) = async_channel::unbounded();
+            panes.sync_herdr_layout(
+                &tree,
+                &herdr_test_spec(std::path::Path::new("herdr")),
+                &tx,
+                false,
+                ctx,
+            );
+
+            assert_eq!(panes.pane_count(), 2);
+            assert!(!panes.herdr_has_pane("herdr-3"));
+            assert!(!panes.has_pane_id(third));
+            // Destroyed, not hidden for undo.
+            assert_eq!(panes.panes.num_hidden_panes(), 0);
+            let root = expect_branch(&panes.panes.root);
+            assert_eq!(expect_leaf(&root.nodes[0].1), first);
+            assert_eq!(expect_leaf(&root.nodes[1].1), second);
+            // The focused pane was closed; focus moved to a survivor.
+            assert_eq!(panes.focused_pane_id(ctx), second);
+        });
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn test_sync_herdr_layout_replaces_all_panes() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+        let dir = tempfile::tempdir().unwrap();
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let first = get_newly_created_pane_id(panes, &[]);
+            register_herdr_panes(panes, &[first]);
+
+            // Every old pane is replaced: the new pane is materialized
+            // before the old one closes, so the tab is never torn down
+            // mid-swap by close_pane's last-pane semantics.
+            let tree = herdr_leaf("herdr-2");
+            let spec = herdr_test_spec(&fake_herdr_bin(dir.path()));
+            let (tx, _rx) = async_channel::unbounded();
+            panes.sync_herdr_layout(&tree, &spec, &tx, false, ctx);
+
+            assert_eq!(panes.pane_count(), 1);
+            assert!(!panes.herdr_has_pane("herdr-1"));
+            assert!(panes.herdr_has_pane("herdr-2"));
+            assert!(!panes.has_pane_id(first));
+            let new_pane = expect_leaf(&panes.panes.root);
+            assert_ne!(new_pane, first);
+            assert_eq!(panes.herdr_pane_id_of(new_pane), Some("herdr-2"));
+            assert_eq!(panes.focused_pane_id(ctx), new_pane);
+        });
+    });
+}
+
+#[test]
+fn test_sync_herdr_layout_skips_group_with_foreign_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let first = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second = get_newly_created_pane_id(panes, &[first]);
+            // Only the first pane is herdr's; the user split a local shell
+            // into the group, which v1 refuses to sync.
+            register_herdr_panes(panes, &[first]);
+
+            let tree = herdr_leaf("herdr-1");
+            let (tx, _rx) = async_channel::unbounded();
+            panes.sync_herdr_layout(
+                &tree,
+                &herdr_test_spec(std::path::Path::new("herdr")),
+                &tx,
+                false,
+                ctx,
+            );
+
+            // No-op: both panes and the untouched root split survive.
+            assert_eq!(panes.pane_count(), 2);
+            assert_eq!(panes.herdr_pane_ids.len(), 1);
+            let root = expect_branch(&panes.panes.root);
+            assert_eq!(root.nodes.len(), 2);
+            assert_eq!(expect_leaf(&root.nodes[0].1), first);
+            assert_eq!(expect_leaf(&root.nodes[1].1), second);
+        });
+    });
+}
+
+#[test]
+fn test_sync_herdr_layout_skips_group_with_hidden_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let first = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second = get_newly_created_pane_id(panes, &[first]);
+            register_herdr_panes(panes, &[first, second]);
+            // Hidden panes (move, job, undo, child agent) sit outside the
+            // tree structure herdr reports, so the sync must leave the group
+            // alone.
+            panes.panes.hide_pane_for_job(second);
+
+            let tree = herdr_split(
+                HerdrSplitDirection::Down,
+                0.25,
+                herdr_leaf("herdr-1"),
+                herdr_leaf("herdr-2"),
+            );
+            let (tx, _rx) = async_channel::unbounded();
+            panes.sync_herdr_layout(
+                &tree,
+                &herdr_test_spec(std::path::Path::new("herdr")),
+                &tx,
+                false,
+                ctx,
+            );
+
+            // No-op: default flexes and the horizontal axis survive, and the
+            // hidden entry is still in place.
+            assert_eq!(panes.pane_count(), 2);
+            assert_eq!(panes.panes.num_hidden_panes(), 1);
+            assert_eq!(panes.herdr_pane_ids.len(), 2);
+            let root = expect_branch(&panes.panes.root);
+            assert_eq!(root.axis(), SplitDirection::Horizontal);
+            let (flex, _) = &root.nodes[0];
+            assert_eq!(flex.0, 1.0);
+        });
+    });
+}
+
+/// Whether `pane_id`'s herdr stream is still pending (deferred; its
+/// subprocess has not been spawned). `None` when the pane has no
+/// herdr_tty-backed manager (e.g. a local-shell fallback pane).
+fn herdr_has_pending_stream(panes: &PaneGroup, pane_id: PaneId, ctx: &AppContext) -> Option<bool> {
+    let manager = panes.terminal_session_by_id(pane_id)?.terminal_manager(ctx);
+    let manager = manager.as_ref(ctx);
+    Some(
+        manager
+            .as_any()
+            .downcast_ref::<HerdrTtyTerminalManager>()?
+            .has_pending_stream(),
+    )
+}
+
+/// A herdr layout materialized with `defer_stream: true` (how the workspace
+/// builds tabs that won't be active) must register every pane as
+/// herdr-attached WITHOUT spawning its stream subprocess. The spec points at
+/// a herdr binary that does not exist: any eager spawn attempt would fail
+/// `create_model` and fall back to a local shell, so a herdr-attached pane
+/// with a pending stream proves no spawn was attempted.
+#[test]
+fn test_herdr_layout_with_defer_stream_leaves_streams_pending() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let dir = tempfile::tempdir().unwrap();
+        let spec = herdr_test_spec(&dir.path().join("missing-herdr"));
+        let (tx, _rx) = async_channel::unbounded();
+        let pane_group = mock_pane_group(
+            &mut app,
+            MockOptions {
+                layout: PanesLayout::Herdr(Box::new(HerdrPanesLayout {
+                    tree: herdr_split(
+                        HerdrSplitDirection::Right,
+                        0.5,
+                        herdr_leaf("herdr-1"),
+                        herdr_leaf("herdr-2"),
+                    ),
+                    base_spec: spec,
+                    on_pane_closed: tx,
+                    defer_stream: true,
+                })),
+                ..Default::default()
+            },
+        );
+
+        pane_group.update(&mut app, |panes, ctx| {
+            assert_eq!(panes.pane_count(), 2);
+            assert!(panes.herdr_has_pane("herdr-1"));
+            assert!(panes.herdr_has_pane("herdr-2"));
+            for pane_id in panes.pane_ids().collect::<Vec<_>>() {
+                assert_eq!(herdr_has_pending_stream(panes, pane_id, ctx), Some(true));
+            }
+        });
+    });
+}
+
+/// The first-view trigger's group half: `attach_pending_herdr_streams` spawns
+/// the deferred subprocess for every herdr pane that still has one pending,
+/// and is a no-op once everything is attached.
+#[cfg(unix)]
+#[test]
+fn test_attach_pending_herdr_streams_attaches_deferred_streams() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let dir = tempfile::tempdir().unwrap();
+        let spec = herdr_test_spec(&fake_herdr_bin(dir.path()));
+        let (tx, _rx) = async_channel::unbounded();
+        let pane_group = mock_pane_group(
+            &mut app,
+            MockOptions {
+                layout: PanesLayout::Herdr(Box::new(HerdrPanesLayout {
+                    tree: herdr_split(
+                        HerdrSplitDirection::Right,
+                        0.5,
+                        herdr_leaf("herdr-1"),
+                        herdr_leaf("herdr-2"),
+                    ),
+                    base_spec: spec,
+                    on_pane_closed: tx,
+                    defer_stream: true,
+                })),
+                ..Default::default()
+            },
+        );
+
+        pane_group.update(&mut app, |panes, ctx| {
+            for pane_id in panes.pane_ids().collect::<Vec<_>>() {
+                assert_eq!(herdr_has_pending_stream(panes, pane_id, ctx), Some(true));
+            }
+            panes.attach_pending_herdr_streams(ctx);
+        });
+
+        // ensure_stream_attached enqueues the spawn (bounded concurrency), so
+        // pump the executor until both panes report attached.
+        let mut attached = false;
+        for _ in 0..200 {
+            attached = pane_group.read(&app, |panes, ctx| {
+                panes
+                    .pane_ids()
+                    .all(|pane_id| herdr_has_pending_stream(panes, pane_id, ctx) == Some(false))
+            });
+            if attached {
+                break;
+            }
+            warpui::r#async::Timer::after(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(attached, "herdr streams still pending after attach");
+
+        // Idempotent: a second attach (e.g. re-activating the tab) does
+        // nothing and must not panic.
+        pane_group.update(&mut app, |panes, ctx| {
+            panes.attach_pending_herdr_streams(ctx);
+            for pane_id in panes.pane_ids().collect::<Vec<_>>() {
+                assert_eq!(herdr_has_pending_stream(panes, pane_id, ctx), Some(false));
+            }
+        });
+    });
+}
+
+/// A herdr layout materialized with `defer_stream: false` (how the workspace
+/// builds a tab that lands active) spawns every pane's stream subprocess
+/// eagerly: nothing is left pending, so there is nothing to attach later.
+#[cfg(unix)]
+#[test]
+fn test_herdr_layout_without_defer_stream_spawns_eagerly() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let dir = tempfile::tempdir().unwrap();
+        let spec = herdr_test_spec(&fake_herdr_bin(dir.path()));
+        let (tx, _rx) = async_channel::unbounded();
+        let pane_group = mock_pane_group(
+            &mut app,
+            MockOptions {
+                layout: PanesLayout::Herdr(Box::new(HerdrPanesLayout {
+                    tree: herdr_split(
+                        HerdrSplitDirection::Right,
+                        0.5,
+                        herdr_leaf("herdr-1"),
+                        herdr_leaf("herdr-2"),
+                    ),
+                    base_spec: spec,
+                    on_pane_closed: tx,
+                    defer_stream: false,
+                })),
+                ..Default::default()
+            },
+        );
+
+        pane_group.update(&mut app, |panes, ctx| {
+            assert_eq!(panes.pane_count(), 2);
+            assert!(panes.herdr_has_pane("herdr-1"));
+            assert!(panes.herdr_has_pane("herdr-2"));
+            for pane_id in panes.pane_ids().collect::<Vec<_>>() {
+                assert_eq!(herdr_has_pending_stream(panes, pane_id, ctx), Some(false));
+            }
+        });
+    });
+}
+
+/// Writes a fake `herdr` that appends its own pid to `<dir>/pids` on every
+/// spawn, then stays alive without emitting frames. The pid log doubles as a
+/// spawn-count marker (one line per spawn) and as the kill list for
+/// simulating stream deaths: `exec` replaces the script process with `sleep`
+/// keeping the same pid, so SIGKILLing the log's last line is exactly the
+/// current stream subprocess dying (stdout EOF → `StreamEvent::Died`).
+#[cfg(unix)]
+fn fake_herdr_bin_with_pid_log(dir: &std::path::Path) -> std::path::PathBuf {
+    crate::herdr::fake_herdr::write_executable_herdr_script(
+        dir,
+        &format!(
+            "#!/bin/sh\necho $$ >> '{}'\nexec sleep 10000\n",
+            dir.join("pids").display()
+        ),
+    )
+}
+
+/// How many stream subprocesses the pid-logging fake herdr has spawned so far.
+#[cfg(unix)]
+fn herdr_spawn_count(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("pids"))
+        .map(|pids| pids.lines().count())
+        .unwrap_or(0)
+}
+
+/// SIGKILLs the most recently spawned fake-herdr subprocess, simulating a
+/// `herdr terminal session control` crash (stdout EOF without a closed
+/// record, i.e. `StreamEvent::Died`).
+#[cfg(unix)]
+fn kill_latest_herdr_stream(dir: &std::path::Path) {
+    let pids = std::fs::read_to_string(dir.join("pids")).unwrap();
+    let pid: libc::pid_t = pids.lines().last().unwrap().parse().unwrap();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+/// Polls `condition` every 10ms for up to ~25s; false on timeout. Same pump
+/// pattern as the attach-pending test's inline loop. The window is generous
+/// because a fully loaded machine (the whole-workspace suite saturating
+/// every core) can delay the fake herdr's fork+echo well past a couple of
+/// seconds; a met condition returns immediately either way, so the ceiling
+/// only costs time on a genuine failure.
+///
+/// ~10s was not enough: a full `--workspace` run (10k tests) timed out both
+/// restart tests here while they pass in well under a second in isolation.
+/// Sized against nextest's 60s terminate-after, leaving room for the several
+/// polls one test chains plus setup.
+#[cfg(unix)]
+async fn poll_until(condition: impl Fn() -> bool) -> bool {
+    for _ in 0..2500 {
+        if condition() {
+            return true;
+        }
+        warpui::r#async::Timer::after(std::time::Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// A dead stream subprocess restarts in place: `restart_herdr_stream`
+/// accepts the restart (the pane keeps its last frame; no close) and the
+/// respawn lands as a second subprocess on the same pane.
+#[cfg(unix)]
+#[test]
+fn test_restart_herdr_stream_respawns_dead_stream() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let dir = tempfile::tempdir().unwrap();
+        let spec = herdr_test_spec(&fake_herdr_bin_with_pid_log(dir.path()));
+        let (tx, _rx) = async_channel::unbounded();
+        let pane_group = mock_pane_group(
+            &mut app,
+            MockOptions {
+                layout: PanesLayout::Herdr(Box::new(HerdrPanesLayout {
+                    tree: herdr_leaf("herdr-1"),
+                    base_spec: spec,
+                    on_pane_closed: tx,
+                    defer_stream: false,
+                })),
+                ..Default::default()
+            },
+        );
+
+        // Eager spawn: the first subprocess comes up with the pane.
+        assert!(poll_until(|| herdr_spawn_count(dir.path()) == 1).await);
+        let pane_id = pane_group.read(&app, |panes, _| panes.pane_ids().next().unwrap());
+        assert_eq!(
+            pane_group.read(&app, |panes, ctx| herdr_has_pending_stream(
+                panes, pane_id, ctx
+            )),
+            Some(false)
+        );
+
+        // The stream subprocess crashes: stdout EOF without a closed record.
+        kill_latest_herdr_stream(dir.path());
+        // EOF observation is asynchronous; give it a beat, then retry the
+        // restart until the manager takes it.
+        warpui::r#async::Timer::after(std::time::Duration::from_millis(100)).await;
+        let mut restarted = false;
+        for _ in 0..100 {
+            restarted = pane_group.update(&mut app, |panes, ctx| {
+                panes.restart_herdr_stream("herdr-1", ctx)
+            });
+            if restarted {
+                break;
+            }
+            warpui::r#async::Timer::after(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(restarted, "restart_herdr_stream refused a first restart");
+
+        // The restart respawns the subprocess; the pane stays tracked and
+        // ends attached again — no pane churn.
+        assert!(poll_until(|| herdr_spawn_count(dir.path()) == 2).await);
+        assert!(
+            poll_until(|| {
+                pane_group.read(&app, |panes, ctx| {
+                    herdr_has_pending_stream(panes, pane_id, ctx) == Some(false)
+                })
+            })
+            .await
+        );
+        pane_group.read(&app, |panes, _| {
+            assert!(panes.herdr_has_pane("herdr-1"));
+            assert_eq!(panes.pane_count(), 1);
+        });
+    });
+}
+
+/// An untracked pane id (a local-shell fallback pane, or a pane the session
+/// never mirrored) has no stream to restart: false, and nothing spawns.
+#[test]
+fn test_restart_herdr_stream_unknown_pane_returns_false() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let dir = tempfile::tempdir().unwrap();
+        // Deferred streams + a missing herdr binary: the pane staying pending
+        // proves the unknown-id restart attempt touched nothing.
+        let spec = herdr_test_spec(&dir.path().join("missing-herdr"));
+        let (tx, _rx) = async_channel::unbounded();
+        let pane_group = mock_pane_group(
+            &mut app,
+            MockOptions {
+                layout: PanesLayout::Herdr(Box::new(HerdrPanesLayout {
+                    tree: herdr_leaf("herdr-1"),
+                    base_spec: spec,
+                    on_pane_closed: tx,
+                    defer_stream: true,
+                })),
+                ..Default::default()
+            },
+        );
+
+        pane_group.update(&mut app, |panes, ctx| {
+            assert!(panes.herdr_has_pane("herdr-1"));
+            assert!(!panes.restart_herdr_stream("herdr-nope", ctx));
+            let pane_id = panes.pane_ids().next().unwrap();
+            assert_eq!(herdr_has_pending_stream(panes, pane_id, ctx), Some(true));
+        });
+    });
+}
+
+/// The restart budget is bounded (3 restarts per 60-second sliding window):
+/// the first three deaths respawn in place, the fourth is refused so the
+/// caller can close the pane instead of churning.
+#[cfg(unix)]
+#[test]
+fn test_restart_herdr_stream_exhausts_retry_budget() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let dir = tempfile::tempdir().unwrap();
+        let spec = herdr_test_spec(&fake_herdr_bin_with_pid_log(dir.path()));
+        let (tx, _rx) = async_channel::unbounded();
+        let pane_group = mock_pane_group(
+            &mut app,
+            MockOptions {
+                layout: PanesLayout::Herdr(Box::new(HerdrPanesLayout {
+                    tree: herdr_leaf("herdr-1"),
+                    base_spec: spec,
+                    on_pane_closed: tx,
+                    defer_stream: false,
+                })),
+                ..Default::default()
+            },
+        );
+
+        // Kill → restart three times; each restart lands a new subprocess.
+        for spawns in 1..=3usize {
+            assert!(poll_until(|| herdr_spawn_count(dir.path()) == spawns).await);
+            kill_latest_herdr_stream(dir.path());
+            // Same asynchronous EOF observation as the single-death test.
+            warpui::r#async::Timer::after(std::time::Duration::from_millis(100)).await;
+            let mut restarted = false;
+            for _ in 0..100 {
+                restarted = pane_group.update(&mut app, |panes, ctx| {
+                    panes.restart_herdr_stream("herdr-1", ctx)
+                });
+                if restarted {
+                    break;
+                }
+                warpui::r#async::Timer::after(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(restarted, "restart #{spawns} refused inside the budget");
+        }
+        assert!(poll_until(|| herdr_spawn_count(dir.path()) == 4).await);
+
+        // A fourth death inside the window exhausts the budget.
+        kill_latest_herdr_stream(dir.path());
+        warpui::r#async::Timer::after(std::time::Duration::from_millis(100)).await;
+        let restarted = pane_group.update(&mut app, |panes, ctx| {
+            panes.restart_herdr_stream("herdr-1", ctx)
+        });
+        assert!(!restarted, "fourth restart within 60s must be refused");
+        // A refused restart does not close or untrack the pane; that decision
+        // belongs to the caller (the connection closes it).
+        pane_group.read(&app, |panes, _| {
+            assert!(panes.herdr_has_pane("herdr-1"));
+            assert_eq!(panes.pane_count(), 1);
+        });
+    });
+}

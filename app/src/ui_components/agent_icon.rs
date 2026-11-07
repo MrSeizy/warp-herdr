@@ -25,7 +25,8 @@ use crate::ui_components::icon_with_status::IconWithStatusVariant;
 ///
 /// Resolution order:
 /// 1. A [`CLIAgentSessionsModel`] session with a known agent wins. Plugin-backed sessions
-///    surface rich status; command-detected sessions don't.
+///    surface rich status, and so do herdr-mirrored sessions (the controller's live
+///    report); command-detected sessions don't.
 /// 2. A task-backed run uses task status and harness so the terminal chrome and the
 ///    matching conversation list card stay in lockstep.
 /// 3. Live ambient pre-dispatch or a selected local conversation falls through to the
@@ -80,12 +81,41 @@ pub(crate) fn terminal_view_agent_icon_variant(
 
     let inputs = TerminalIconInputs {
         is_ambient: is_cloud,
-        cli_session: cli_agent_session.map(|session| CLISessionInputs {
-            agent: session.agent,
-            has_listener: session.listener.is_some(),
-            status: session.status.to_conversation_status(),
-            supports_rich_status: session.supports_rich_status(),
-        }),
+        cli_session: cli_agent_session
+            .map(|session| {
+                // A foreign-controlled (herdr control mode) pane's seeded
+                // session carries the controller's live agent status, kept
+                // fresh by `TerminalView::sync_herdr_cli_agent_session_status`.
+                // Surface it like a plugin-backed session's rich status: the
+                // waterfall only shows a status for listener-backed inputs
+                // with rich-status support, so a foreign session reports both.
+                let reports_live_status = terminal_view.is_foreign_controlled();
+                CLISessionInputs {
+                    agent: session.agent,
+                    has_listener: session.listener.is_some() || reports_live_status,
+                    status: session.status.to_conversation_status(),
+                    supports_rich_status: session.supports_rich_status() || reports_live_status,
+                }
+            })
+            // Foreign-controlled panes (herdr control mode) with no seeded
+            // session (the controller's agent report landed before the
+            // session seed did) get the reported agent with command-detected
+            // treatment: icon, no rich status. Once the session is seeded the
+            // arm above wins and carries the controller's live status.
+            .or_else(|| {
+                terminal_view
+                    .foreign_controlled_cli_agent(app)
+                    .map(|agent| CLISessionInputs {
+                        agent,
+                        has_listener: false,
+                        // Intentionally discarded by the waterfall: with
+                        // has_listener/supports_rich_status false the status is
+                        // nulled out. The live status arrives once the session
+                        // seed lands (see above).
+                        status: ConversationStatus::InProgress,
+                        supports_rich_status: false,
+                    })
+            }),
         selected_third_party_cli_agent: terminal_view
             .ambient_agent_view_model()
             .and_then(|model| model.as_ref(app).selected_third_party_cli_agent()),
@@ -125,12 +155,13 @@ struct TerminalIconInputs {
 /// CLI-session-derived inputs for the terminal waterfall.
 struct CLISessionInputs {
     agent: CLIAgent,
-    /// Whether the session is backed by a plugin listener. Plugin-backed sessions report
-    /// rich status; command-detected sessions only know that an agent is running.
+    /// Whether the session reports live status from a backing source: a plugin listener
+    /// (plugin-backed sessions report rich status; command-detected sessions only know
+    /// that an agent is running), or the foreign controller for herdr-mirrored panes.
     has_listener: bool,
     status: ConversationStatus,
-    /// Whether the agent's session handler exposes rich status (plugin-backed handlers report
-    /// rich status; Codex's OSC 9 handler does not).
+    /// Whether the session's status source exposes rich status (plugin-backed handlers report
+    /// rich status; Codex's OSC 9 handler does not; herdr's controller report does).
     supports_rich_status: bool,
 }
 
@@ -140,7 +171,9 @@ fn agent_icon_variant_from_terminal_inputs(
     inputs: &TerminalIconInputs,
 ) -> Option<IconWithStatusVariant> {
     // 1. CLI session with a known (non-Unknown) agent wins. Status is only meaningful when
-    //    the session is plugin-backed and the handler exposes rich status.
+    //    the session reports live status: plugin-backed with a rich-status handler, or
+    //    herdr-mirrored (its inputs are synthesized accordingly by
+    //    `terminal_view_agent_icon_variant`).
     if let Some(session) = inputs
         .cli_session
         .as_ref()

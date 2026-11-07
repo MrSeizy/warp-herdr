@@ -477,6 +477,20 @@ pub struct TerminalModel {
     pending_shell_recovery_status: Option<ObservedExitStatus>,
     shell_replacement_pending: bool,
 
+    /// Manual read-only override, folded into [`TerminalModel::is_read_only`].
+    /// Used to mark herdr-mirrored panes read-only during outages, when the
+    /// controller connection is down and input must not reach a pane Warp no
+    /// longer controls.
+    forced_read_only: bool,
+
+    /// True when a foreign process (herdr control mode) owns the real shell.
+    /// Warp must not bootstrap or otherwise inject into such terminals.
+    foreign_controlled: bool,
+    /// Keeps a taken-over pane read-only until a newly attached stream delivers a frame.
+    foreign_control_released: bool,
+    /// herdr control mode: the agent the controller reports for this pane.
+    foreign_agent: Option<String>,
+
     /// The shell type of the login shell for this session.
     shell_launch_state: ShellLaunchState,
 
@@ -1111,6 +1125,10 @@ impl TerminalModel {
             is_receiving_kitty_image_data: IsReceivingKittyActionData::No,
             did_receive_rc_file_dcs: None,
             handled_exit: false,
+            forced_read_only: false,
+            foreign_controlled: false,
+            foreign_control_released: false,
+            foreign_agent: None,
             pending_shell_recovery_status: None,
             shell_replacement_pending: false,
             env_var_collection_name: None,
@@ -1593,8 +1611,18 @@ impl TerminalModel {
 
     pub fn is_read_only(&self) -> bool {
         self.handled_exit
+            || self.forced_read_only
+            || self.foreign_control_released
             || self.is_conversation_transcript_viewer()
             || self.shared_session_status().is_finished_viewer()
+    }
+
+    /// Sets a manual read-only override, folded into
+    /// [`TerminalModel::is_read_only`]. Used to mark herdr-mirrored panes
+    /// read-only during outages, when the controller connection is down and
+    /// input must not reach a pane Warp no longer controls.
+    pub fn set_forced_read_only(&mut self, value: bool) {
+        self.forced_read_only = value;
     }
 
     pub fn is_conversation_transcript_viewer(&self) -> bool {
@@ -2609,6 +2637,35 @@ impl TerminalModel {
     /// this ID will be accepted by the integrity check.
     pub fn register_session_id(&mut self, session_id: SessionId) {
         self.registered_session_ids.insert(session_id);
+    }
+
+    /// Marks this terminal as mirrored from a foreign process (herdr control
+    /// mode) that owns the real shell; Warp must not inject bootstrap scripts.
+    pub fn set_foreign_controlled(&mut self) {
+        self.foreign_controlled = true;
+    }
+
+    pub fn is_foreign_controlled(&self) -> bool {
+        self.foreign_controlled
+    }
+
+    pub fn foreign_control_released(&self) -> bool {
+        self.foreign_control_released
+    }
+
+    pub fn set_foreign_control_released(&mut self, released: bool) {
+        self.foreign_control_released = released;
+    }
+
+    pub fn set_foreign_agent(&mut self, agent: Option<String>) {
+        self.foreign_agent = agent;
+    }
+
+    /// The CLI agent the foreign controller reports running in this pane
+    /// (e.g. "claude"). Updated live as agents start and stop; drives icon
+    /// detection since foreign panes never emit Warp's integration events.
+    pub fn foreign_agent(&self) -> Option<&str> {
+        self.foreign_agent.as_deref()
     }
 
     pub fn needs_bracketed_paste(&mut self) -> bool {

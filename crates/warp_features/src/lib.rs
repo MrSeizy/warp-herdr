@@ -949,6 +949,9 @@ pub enum FeatureFlag {
     /// pre-auth slides and post-auth account offer.
     AccountFirstOnboarding,
 
+    /// Enables herdr control mode: mirroring tabs and panes from an external
+    /// herdr orchestrator into the workspace.
+    HerdrControlMode,
     /// Accepts well-known non-UUID managed MCP ids (e.g. `"linear"`) as
     /// `warp_id` values in MCP configs and as bare identifiers in CLI
     /// `--mcp` arguments, resolved server-side at run setup.
@@ -1079,6 +1082,8 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::MultiLevelOrchestration,
     FeatureFlag::McpJsonTreeView,
     FeatureFlag::BoxDrawingGlyphs,
+    FeatureFlag::AccountFirstOnboarding,
+    FeatureFlag::HerdrControlMode,
     FeatureFlag::CtrlCCancelsThirdPartyHarness,
     FeatureFlag::WarpingModelName,
     FeatureFlag::LrcActivitySignal,
@@ -1113,7 +1118,13 @@ pub const RELEASE_FLAGS: &[FeatureFlag] = &[
 ];
 
 /// Flags that we want to allow to switch at runtime (assuming RuntimeFeatureFlags is set)
-pub const RUNTIME_FEATURE_FLAGS: &[FeatureFlag] = &[FeatureFlag::LocalClaudeCodexChildHarnesses];
+pub const RUNTIME_FEATURE_FLAGS: &[FeatureFlag] = &[
+    FeatureFlag::LocalClaudeCodexChildHarnesses,
+    // Dogfood-gated, but its development loop runs on the OSS/local binary
+    // where dogfood flags are off; the Debug-menu toggle is how dev builds
+    // exercise it (the palette attach/detach commands gate on it).
+    FeatureFlag::HerdrControlMode,
+];
 
 impl FeatureFlag {
     pub fn is_enabled(&self) -> bool {

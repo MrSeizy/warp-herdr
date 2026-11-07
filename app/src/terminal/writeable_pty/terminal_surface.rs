@@ -7,11 +7,13 @@ use warp_completer::meta::Span;
 use warpui::AppContext;
 use warpui::{Entity, ViewContext};
 
+use super::ScrollSource;
 use crate::ai::agent::AIAgentPtyWriteMode;
 use crate::server::telemetry::CloudAgentShellRecoveryFailureClass;
 #[cfg(unix)]
 use crate::terminal::event::AfterBlockCompletedEvent;
 use crate::terminal::model::completions::ShellCompletion;
+use crate::terminal::model::mouse::MouseState;
 #[cfg(unix)]
 use crate::terminal::model::terminal_model::BlockIndex;
 use crate::terminal::view::ExecuteCommandEvent;
@@ -29,11 +31,20 @@ pub enum PtyIntent {
     Interrupt,
     ShutdownPty,
     WriteBytes(Cow<'static, [u8]>),
+    Mouse(MouseState),
     WriteAgentInput {
         bytes: Cow<'static, [u8]>,
         mode: AIAgentPtyWriteMode,
     },
     Resize(SizeUpdate),
+    /// Scroll a pane whose scrollback is owned by the backend (herdr control
+    /// mode) instead of by Warp's grid; backends with a Warp-side grid never
+    /// receive these because only foreign-controlled panes emit them.
+    Scroll {
+        up: bool,
+        lines: u32,
+        source: ScrollSource,
+    },
     ExecuteCommand(ExecuteCommandEvent),
     RunNativeShellCompletions {
         buffer_text: String,

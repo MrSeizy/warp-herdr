@@ -97,12 +97,14 @@ impl RememberForWarpification {
 
 #[derive(Clone)]
 pub enum TerminalAction {
+    RetakeHerdrControl,
     Scroll {
         delta: Lines,
     },
     AltScroll {
         delta: i32,
         point: Point,
+        modifiers: ModifiersState,
     },
     SharedSessionViewerAltScroll {
         new_scroll_top: Lines,
@@ -476,6 +478,7 @@ impl fmt::Debug for TerminalAction {
         use TerminalAction::*;
 
         match self {
+            RetakeHerdrControl => write!(f, "RetakeHerdrControl"),
             Scroll { delta } => write!(f, "Scroll {{ delta: {delta} }}"),
             AltScroll { delta, .. } => write!(f, "AltScroll {{ delta: {delta} }}"),
             SharedSessionViewerAltScroll { new_scroll_top } => write!(

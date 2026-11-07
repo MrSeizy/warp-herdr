@@ -174,7 +174,7 @@ pub enum Direction {
 }
 
 impl Direction {
-    fn axis(&self) -> SplitDirection {
+    pub fn axis(&self) -> SplitDirection {
         match self {
             Direction::Left | Direction::Right => SplitDirection::Horizontal,
             Direction::Up | Direction::Down => SplitDirection::Vertical,

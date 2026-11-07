@@ -26,3 +26,23 @@ fn local_child_harnesses_are_local_only_by_default() {
     assert!(!DEBUG_FLAGS.contains(&FeatureFlag::LocalClaudeCodexChildHarnesses));
     assert!(!DOGFOOD_FLAGS.contains(&FeatureFlag::LocalClaudeCodexChildHarnesses));
 }
+
+/// Herdr control mode is dogfood-gated, but its development loop runs on the
+/// OSS/local binary (script/run without warp-channel-config), where dogfood
+/// flags are off. The Debug menu's runtime toggle is the sanctioned way to
+/// exercise it there — dropping it from this list silently hides the
+/// attach/detach commands from every dev build.
+#[test]
+fn herdr_control_mode_is_runtime_toggleable_for_dev_builds() {
+    assert!(RUNTIME_FEATURE_FLAGS.contains(&FeatureFlag::HerdrControlMode));
+    assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::HerdrControlMode));
+}
+
+#[test]
+fn account_first_onboarding_is_dogfood_only() {
+    assert!(!LOCAL_FLAGS.contains(&FeatureFlag::AccountFirstOnboarding));
+    assert!(!DEBUG_FLAGS.contains(&FeatureFlag::AccountFirstOnboarding));
+    assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::AccountFirstOnboarding));
+    assert!(!PREVIEW_FLAGS.contains(&FeatureFlag::AccountFirstOnboarding));
+    assert!(!RELEASE_FLAGS.contains(&FeatureFlag::AccountFirstOnboarding));
+}

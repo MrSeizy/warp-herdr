@@ -12,13 +12,14 @@ use warp_util::path::ShellFamily;
 use warpui::r#async::block_on;
 use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity};
 
-use super::Message;
+use super::{Message, ScrollSource};
 use crate::SessionSettings;
 use crate::ai::agent::AIAgentPtyWriteMode;
 use crate::terminal::input::CommandExecutionSource;
 use crate::terminal::line_editor_status::{LineEditorStatus, LineEditorStatusEvent};
 use crate::terminal::model::ansi::Handler;
 use crate::terminal::model::completions::ShellCompletion;
+use crate::terminal::model::mouse::MouseState;
 use crate::terminal::model::session::{
     ExecutorCommandEvent, InBandCommandCancelledEvent, SessionInfo, Sessions,
 };
@@ -327,6 +328,12 @@ impl<T: EventLoopSender> PtyController<T> {
         pending_session_info: &SessionInfo,
         ctx: &mut ModelContext<Self>,
     ) {
+        // Foreign-controlled terminals (herdr control mode) already run a
+        // fully bootstrapped shell owned by another process; injecting the
+        // bootstrap script would type 29KB of zsh into that pane.
+        if self.terminal_model.lock().is_foreign_controlled() {
+            return;
+        }
         let shell_type = pending_session_info.shell.shell_type();
 
         #[cfg(feature = "local_fs")]
@@ -569,6 +576,23 @@ impl<T: EventLoopSender> PtyController<T> {
         {
             self.send_message_to_event_loop(Message::Resize(size_update.new_size), ctx);
         }
+    }
+
+    /// Forwards a scroll request to the event loop for backends whose
+    /// scrollback lives outside Warp's grid (herdr control mode); event
+    /// loops with a Warp-side grid ignore the message.
+    pub fn scroll_pty(
+        &self,
+        up: bool,
+        lines: u32,
+        source: ScrollSource,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.send_message_to_event_loop(Message::Scroll { up, lines, source }, ctx);
+    }
+
+    pub fn mouse_pty(&self, state: MouseState, ctx: &mut ModelContext<Self>) {
+        self.send_message_to_event_loop(Message::Mouse(state), ctx);
     }
 
     /// Writes agent input to the PTY.

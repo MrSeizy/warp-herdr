@@ -2137,6 +2137,24 @@ fn test_workspace_sessions_retrieves_tabs() {
 }
 
 #[test]
+fn test_workspace_sessions_reads_terminal_model_metadata() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            let session = workspace
+                .workspace_sessions(ctx.window_id(), ctx)
+                .next()
+                .expect("workspace should contain a terminal session");
+
+            assert!(!session.is_foreign_controlled());
+        });
+    });
+}
+
+#[test]
 fn ctrl_t_action_forwards_to_pty_when_no_external_widget_detected() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);

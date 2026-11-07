@@ -2937,6 +2937,22 @@ pub enum TelemetryEvent {
         origin: TelemetryQueuedQueryOrigin,
         trigger: QueuedPromptSendNowTrigger,
     },
+    /// Emitted when a herdr session attach succeeds and its tabs/panes are
+    /// mirrored into the workspace.
+    HerdrSessionAttached {
+        tab_count: usize,
+        pane_count: usize,
+    },
+    /// Emitted when the attached herdr session is detached: the mirrored tabs
+    /// close locally without touching the herdr session.
+    HerdrSessionDetached,
+    /// Emitted when the attached herdr server becomes unreachable (event
+    /// stream closed or heartbeat ping failed). Only on an actual
+    /// connected→disconnected transition, matching the disconnect banner.
+    HerdrDisconnected,
+    /// Emitted when the connection to the attached herdr server is restored
+    /// and the mirror has been rebuilt from a fresh snapshot.
+    HerdrReconnected,
 }
 
 impl TelemetryEventTrait for TelemetryEvent {
@@ -4748,6 +4764,16 @@ impl TelemetryEvent {
                 "origin": origin,
                 "trigger": trigger,
             })),
+            TelemetryEvent::HerdrSessionAttached {
+                tab_count,
+                pane_count,
+            } => Some(json!({
+                "tab_count": tab_count,
+                "pane_count": pane_count,
+            })),
+            TelemetryEvent::HerdrSessionDetached
+            | TelemetryEvent::HerdrDisconnected
+            | TelemetryEvent::HerdrReconnected => None,
         }
     }
 
@@ -5201,6 +5227,10 @@ impl TelemetryEvent {
             | TelemetryEvent::RemoteServerReconnectExhausted { .. }
             | TelemetryEvent::RemoteCodebaseIndexStatusChanged { .. }
             | TelemetryEvent::RemoteCodebaseAutoIndexRequested { .. } => false,
+            TelemetryEvent::HerdrSessionAttached { .. }
+            | TelemetryEvent::HerdrSessionDetached
+            | TelemetryEvent::HerdrDisconnected
+            | TelemetryEvent::HerdrReconnected => false,
             #[cfg(feature = "local_fs")]
             TelemetryEvent::CodePaneOpened { .. }
             | TelemetryEvent::CodePanelsFileOpened { .. }
@@ -5759,6 +5789,10 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             | Self::QueuedPromptReordered
             | Self::QueuedPromptPanelCollapseToggled
             | Self::QueuedPromptSentNow => EnablementState::Flag(FeatureFlag::QueueSlashCommand),
+            Self::HerdrSessionAttached { .. }
+            | Self::HerdrSessionDetached
+            | Self::HerdrDisconnected
+            | Self::HerdrReconnected => EnablementState::Flag(FeatureFlag::HerdrControlMode),
         }
     }
 
@@ -6154,6 +6188,10 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::QueuedPromptReordered => "QueuedPrompt.Reordered",
             Self::QueuedPromptPanelCollapseToggled => "QueuedPrompt.PanelCollapseToggled",
             Self::QueuedPromptSentNow => "QueuedPrompt.SentNow",
+            Self::HerdrSessionAttached => "Herdr.SessionAttached",
+            Self::HerdrSessionDetached => "Herdr.SessionDetached",
+            Self::HerdrDisconnected => "Herdr.Disconnected",
+            Self::HerdrReconnected => "Herdr.Reconnected",
             #[cfg(windows)]
             Self::WSLRegistryError => "WSL Distribution Registry Error",
             #[cfg(windows)]
@@ -7168,6 +7206,18 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             }
             Self::QueuedPromptSentNow => {
                 "User sent a queued prompt row immediately (send-now button or Enter on empty input)"
+            }
+            Self::HerdrSessionAttached => {
+                "A herdr session attach succeeded and its tabs/panes were mirrored"
+            }
+            Self::HerdrSessionDetached => {
+                "The attached herdr session was detached and its mirrors closed locally"
+            }
+            Self::HerdrDisconnected => {
+                "The attached herdr server became unreachable (stream closed or heartbeat failed)"
+            }
+            Self::HerdrReconnected => {
+                "The connection to the attached herdr server was restored and resynced"
             }
         }
     }

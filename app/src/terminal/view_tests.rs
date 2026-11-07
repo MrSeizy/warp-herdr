@@ -69,8 +69,8 @@ use crate::terminal::cli_agent_sessions::event::{
 };
 use crate::terminal::cli_agent_sessions::listener::CLIAgentSessionListener;
 use crate::terminal::cli_agent_sessions::{
-    CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentRichInputCloseReason, CLIAgentSession,
-    CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
+    BlockedSource, CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentRichInputCloseReason,
+    CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
 };
 use crate::terminal::model::ansi::{self, BootstrappedValue, InitShellValue, PreexecValue};
 use crate::terminal::model::block::AgentViewVisibility;
@@ -8550,6 +8550,672 @@ fn ctrl_g_toggles_cli_agent_rich_input_from_terminal_context() {
     })
 }
 
+/// Herdr-mirrored panes never emit the shell-integration hooks that drive
+/// local CLI agent detection, so the session must be seeded from the agent
+/// herdr reports. Without a session the Ctrl-G binding's context predicates
+/// never match and the keystroke falls through to the agent as raw input.
+#[test]
+fn sync_herdr_cli_agent_session_seeds_session_and_sets_ctrl_g_context_flags() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(ImportedConfigModel::new);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            // Before sync: no session, so the Ctrl-G binding's context flags
+            // are absent.
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_none()
+            );
+            let context = view.keymap_context(ctx);
+            assert!(!context.set.contains(flags::CLI_AGENT_FOOTER_ENABLED));
+            assert!(
+                !context
+                    .set
+                    .contains(flags::CLI_AGENT_RICH_INPUT_CHIP_ENABLED)
+            );
+
+            view.sync_herdr_cli_agent_session(Some("claude"), AgentStatus::Working, ctx);
+
+            let session = CLIAgentSessionsModel::as_ref(ctx).session(view.view_id);
+            assert!(
+                session.is_some_and(|s| s.agent == CLIAgent::Claude && s.listener.is_none()),
+                "herdr-reported agent should seed a CLI agent session"
+            );
+
+            // The Ctrl-G open binding (view/init.rs) requires exactly these
+            // flags plus LongRunningCommand/AltScreen, which herdr panes
+            // always satisfy via their forced alt screen.
+            let context = view.keymap_context(ctx);
+            assert!(context.set.contains(flags::CLI_AGENT_FOOTER_ENABLED));
+            assert!(
+                context
+                    .set
+                    .contains(flags::CLI_AGENT_RICH_INPUT_CHIP_ENABLED)
+            );
+        });
+    })
+}
+
+/// Re-syncing the agent herdr already reported must not clobber accumulated
+/// session state (e.g. drafts), while an agent change replaces the session.
+#[test]
+fn sync_herdr_cli_agent_session_replaces_on_agent_change_but_not_on_resync() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.sync_herdr_cli_agent_session(Some("claude"), AgentStatus::Working, ctx);
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, _| {
+                sessions.set_draft(view.view_id, "draft".to_owned());
+            });
+
+            // Same agent: session state is preserved.
+            view.sync_herdr_cli_agent_session(Some("claude"), AgentStatus::Working, ctx);
+            assert_eq!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .and_then(|s| s.draft_text.as_deref()),
+                Some("draft")
+            );
+
+            // Different agent: the session is replaced wholesale.
+            view.sync_herdr_cli_agent_session(Some("codex"), AgentStatus::Working, ctx);
+            let session = CLIAgentSessionsModel::as_ref(ctx).session(view.view_id);
+            assert!(
+                session.is_some_and(|s| s.agent == CLIAgent::Codex && s.draft_text.is_none()),
+                "agent change should replace the session"
+            );
+        });
+    })
+}
+
+/// When herdr reports the agent exited (`None`), sessions seeded by the herdr
+/// sync are removed, but plugin-backed (OSC 777) sessions — which own a
+/// listener — are preserved.
+#[test]
+fn sync_herdr_cli_agent_session_none_removes_only_seeded_sessions() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.sync_herdr_cli_agent_session(Some("claude"), AgentStatus::Working, ctx);
+            view.sync_herdr_cli_agent_session(None, AgentStatus::Unknown, ctx);
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_none(),
+                "agent exit should remove a herdr-seeded session"
+            );
+
+            // A plugin-backed session survives herdr reporting no agent.
+            let listener = ctx.add_model(|ctx| {
+                CLIAgentSessionListener::new(
+                    view.view_id,
+                    CLIAgent::Claude,
+                    &view.model_events_handle,
+                    ctx,
+                )
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    CLIAgentSession {
+                        agent: CLIAgent::Claude,
+                        status: CLIAgentSessionStatus::InProgress,
+                        session_context: CLIAgentSessionContext::default(),
+                        input_state: CLIAgentInputState::Closed,
+                        should_auto_toggle_input: false,
+                        listener: Some(listener),
+                        remote_host: None,
+                        plugin_version: Some("1.0.0".to_owned()),
+                        draft_text: None,
+                        custom_command_prefix: None,
+                        received_rich_notification: true,
+                    },
+                    ctx,
+                );
+            });
+            view.sync_herdr_cli_agent_session(None, AgentStatus::Unknown, ctx);
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_some(),
+                "agent exit must not remove a plugin-backed session"
+            );
+        });
+    })
+}
+
+/// Agent strings that don't map to a known CLI agent seed nothing.
+#[test]
+fn sync_herdr_cli_agent_session_ignores_unknown_agents() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.sync_herdr_cli_agent_session(Some("vim"), AgentStatus::Working, ctx);
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_none()
+            );
+        });
+    })
+}
+
+/// An unrecognized foreground agent maps to `None` via `CLIAgent::detect`, so
+/// it removes a seeded session just like herdr reporting no agent does.
+#[test]
+fn sync_herdr_cli_agent_session_unrecognized_agent_removes_seeded_session() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.sync_herdr_cli_agent_session(Some("claude"), AgentStatus::Working, ctx);
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_some()
+            );
+
+            view.sync_herdr_cli_agent_session(Some("vim"), AgentStatus::Working, ctx);
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_none(),
+                "an unrecognized agent should remove the seeded session via the None arm"
+            );
+        });
+    })
+}
+
+/// An agent change reported by herdr must not clobber a plugin-backed (OSC
+/// 777) session: the listener-owning session takes precedence, mirroring the
+/// None arm's preservation rule.
+#[test]
+fn sync_herdr_cli_agent_session_agent_change_preserves_plugin_backed_session() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            let listener = ctx.add_model(|ctx| {
+                CLIAgentSessionListener::new(
+                    view.view_id,
+                    CLIAgent::Claude,
+                    &view.model_events_handle,
+                    ctx,
+                )
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    CLIAgentSession {
+                        agent: CLIAgent::Claude,
+                        status: CLIAgentSessionStatus::InProgress,
+                        session_context: CLIAgentSessionContext::default(),
+                        input_state: CLIAgentInputState::Closed,
+                        should_auto_toggle_input: false,
+                        listener: Some(listener),
+                        remote_host: None,
+                        plugin_version: Some("1.0.0".to_owned()),
+                        draft_text: None,
+                        custom_command_prefix: None,
+                        received_rich_notification: true,
+                    },
+                    ctx,
+                );
+            });
+
+            view.sync_herdr_cli_agent_session(Some("codex"), AgentStatus::Working, ctx);
+            let session = CLIAgentSessionsModel::as_ref(ctx).session(view.view_id);
+            assert!(
+                session.is_some_and(|s| s.agent == CLIAgent::Claude && s.listener.is_some()),
+                "agent change must not replace a plugin-backed session"
+            );
+        });
+    })
+}
+
+/// Auto-open must not fire for an unfocused view: seeding panes in
+/// inactive tabs would steal focus into an unmounted view, deadening
+/// workspace-scoped bindings.
+#[test]
+fn seeding_unfocused_view_does_not_auto_open_rich_input() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(ImportedConfigModel::new);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .auto_open_rich_input_on_cli_agent_start
+                .set_value(true, ctx);
+        });
+        let (window_id, terminal) = add_window_with_id_and_terminal(&mut app, None);
+        // Move focus to a sibling view: materialized herdr panes live in
+        // inactive tabs, so the seeded view never holds focus there.
+        let tips_model = app.add_model(|_| Default::default());
+        let other = app.add_view(window_id, |ctx| {
+            crate::terminal::TerminalView::new_for_test(tips_model, None, ctx)
+        });
+        terminal.update(&mut app, |_view, ctx| ctx.focus(&other));
+
+        terminal.update(&mut app, |view, ctx| {
+            assert!(
+                !ctx.is_self_or_child_focused(),
+                "harness precondition: the view under test must be unfocused"
+            );
+            view.sync_herdr_cli_agent_session(Some("claude"), AgentStatus::Working, ctx);
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_some(),
+                "session should still seed"
+            );
+            assert!(
+                !view.has_active_cli_agent_input_session(ctx),
+                "rich input must not auto-open (and steal focus) on an unfocused view"
+            );
+        });
+    })
+}
+
+/// Control: auto-open still fires when the seeded view is focused.
+#[test]
+fn seeding_focused_view_auto_opens_rich_input() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(ImportedConfigModel::new);
+        let _cli_rich = FeatureFlag::CLIAgentRichInput.override_enabled(true);
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            let _ = settings
+                .auto_open_rich_input_on_cli_agent_start
+                .set_value(true, ctx);
+        });
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |_view, ctx| ctx.focus_self());
+        terminal.update(&mut app, |view, ctx| {
+            assert!(
+                ctx.is_self_or_child_focused(),
+                "focus effect should have applied"
+            );
+            view.sync_herdr_cli_agent_session(Some("claude"), AgentStatus::Working, ctx);
+            assert!(
+                view.has_active_cli_agent_input_session(ctx),
+                "rich input should auto-open for a focused view"
+            );
+        });
+    })
+}
+
+/// A freshly seeded session's initial status comes from the herdr-reported
+/// pane status: Done seeds Success, Working seeds InProgress, Blocked seeds
+/// Blocked. herdr's snapshot status is seen-aware (finished-while-unseen
+/// reports Done directly), so the seed needs no coercion. Idle seeds Success
+/// — the session model has no idle-at-prompt state, and a check mark
+/// ("finished earlier") beats a spinner falsely claiming the agent is
+/// running. Unknown seeds InProgress, the legacy default assumption.
+#[test]
+fn sync_herdr_cli_agent_session_seeds_status_from_herdr_status() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            for (herdr_status, expected) in [
+                (AgentStatus::Done, CLIAgentSessionStatus::Success),
+                (AgentStatus::Working, CLIAgentSessionStatus::InProgress),
+                (
+                    AgentStatus::Blocked,
+                    CLIAgentSessionStatus::Blocked {
+                        message: None,
+                        source: BlockedSource::NeedsInput,
+                    },
+                ),
+                (AgentStatus::Idle, CLIAgentSessionStatus::Success),
+                (AgentStatus::Unknown, CLIAgentSessionStatus::InProgress),
+            ] {
+                // Remove any prior session so each round is a fresh seed —
+                // resyncing an existing same-agent session must never touch
+                // its status (covered by the resync test above).
+                view.sync_herdr_cli_agent_session(None, AgentStatus::Unknown, ctx);
+                view.sync_herdr_cli_agent_session(Some("claude"), herdr_status, ctx);
+                assert_eq!(
+                    CLIAgentSessionsModel::as_ref(ctx)
+                        .session(view.view_id)
+                        .map(|s| s.status.clone()),
+                    Some(expected),
+                    "seed status for herdr {herdr_status:?}"
+                );
+            }
+        });
+    })
+}
+
+/// herdr's live per-pane agent status lands on the seeded session: Working
+/// maps to InProgress, Blocked to Blocked, and Done to Success. Idle and
+/// Unknown leave the last real status untouched, mirroring the plugin
+/// protocol's IdlePrompt, and the session is mutated in place (drafts
+/// survive) rather than replaced.
+#[test]
+fn sync_herdr_cli_agent_session_status_applies_to_seeded_session() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.sync_herdr_cli_agent_session(Some("claude"), AgentStatus::Working, ctx);
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, _| {
+                sessions.set_draft(view.view_id, "draft".to_owned());
+            });
+
+            let view_id = view.view_id;
+            let status = |ctx: &AppContext| {
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view_id)
+                    .map(|s| s.status.clone())
+            };
+
+            view.sync_herdr_cli_agent_session_status(AgentStatus::Done, ctx);
+            assert_eq!(status(ctx), Some(CLIAgentSessionStatus::Success));
+
+            view.sync_herdr_cli_agent_session_status(AgentStatus::Working, ctx);
+            assert_eq!(status(ctx), Some(CLIAgentSessionStatus::InProgress));
+
+            view.sync_herdr_cli_agent_session_status(AgentStatus::Blocked, ctx);
+            assert!(
+                matches!(status(ctx), Some(CLIAgentSessionStatus::Blocked { .. })),
+                "herdr Blocked should map to a blocked session status"
+            );
+
+            // Idle and Unknown carry no status signal: the last real status
+            // stays.
+            view.sync_herdr_cli_agent_session_status(AgentStatus::Idle, ctx);
+            assert!(
+                matches!(status(ctx), Some(CLIAgentSessionStatus::Blocked { .. })),
+                "Idle must not override the last real status"
+            );
+            view.sync_herdr_cli_agent_session_status(AgentStatus::Unknown, ctx);
+            assert!(
+                matches!(status(ctx), Some(CLIAgentSessionStatus::Blocked { .. })),
+                "Unknown must not override the last real status"
+            );
+
+            assert_eq!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .and_then(|s| s.draft_text.as_deref()),
+                Some("draft"),
+                "status sync must mutate the session in place, not replace it"
+            );
+        });
+    })
+}
+
+/// A plugin-backed (OSC 777) session reports its own richer status, so
+/// herdr's report must not clobber it — the same preservation rule
+/// `sync_herdr_cli_agent_session` applies to agent changes.
+#[test]
+fn sync_herdr_cli_agent_session_status_preserves_plugin_backed_session() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            let listener = ctx.add_model(|ctx| {
+                CLIAgentSessionListener::new(
+                    view.view_id,
+                    CLIAgent::Claude,
+                    &view.model_events_handle,
+                    ctx,
+                )
+            });
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    CLIAgentSession {
+                        agent: CLIAgent::Claude,
+                        status: CLIAgentSessionStatus::InProgress,
+                        session_context: CLIAgentSessionContext::default(),
+                        input_state: CLIAgentInputState::Closed,
+                        should_auto_toggle_input: false,
+                        listener: Some(listener),
+                        remote_host: None,
+                        plugin_version: Some("1.0.0".to_owned()),
+                        draft_text: None,
+                        custom_command_prefix: None,
+                        received_rich_notification: true,
+                    },
+                    ctx,
+                );
+            });
+
+            view.sync_herdr_cli_agent_session_status(AgentStatus::Blocked, ctx);
+            view.sync_herdr_cli_agent_session_status(AgentStatus::Done, ctx);
+            let session = CLIAgentSessionsModel::as_ref(ctx).session(view.view_id);
+            assert!(
+                session.is_some_and(
+                    |s| s.listener.is_some() && s.status == CLIAgentSessionStatus::InProgress
+                ),
+                "herdr status sync must not touch a plugin-backed session"
+            );
+        });
+    })
+}
+
+/// With no session (e.g. herdr reports a status for a pane whose agent was
+/// never detected), the status sync is a no-op.
+#[test]
+fn sync_herdr_cli_agent_session_status_noops_without_session() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.sync_herdr_cli_agent_session_status(AgentStatus::Working, ctx);
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(view.view_id)
+                    .is_none()
+            );
+        });
+    })
+}
+
+/// The forced read-only override (used to lock herdr-mirrored panes during
+/// controller outages) flips `is_read_only` in both directions.
+#[test]
+fn forced_read_only_toggles_is_read_only() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        terminal.update(&mut app, |view, _ctx| {
+            let mut model = view.model.lock();
+            assert!(!model.is_read_only());
+            model.set_forced_read_only(true);
+            assert!(model.is_read_only());
+            model.set_forced_read_only(false);
+            assert!(!model.is_read_only());
+        });
+    })
+}
+
+/// A mirrored (foreign-controlled) pane forwards wheel scrolls to herdr as
+/// `terminal.scroll` instead of encoding them to PTY bytes or touching the
+/// local grid: herdr owns the scrollback, including pre-attach history the
+/// grid never had, and routes wheel scrolls to programs that requested
+/// mouse reporting.
+#[test]
+fn alt_scroll_forwards_to_herdr_for_foreign_controlled_pane() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let captured = commands.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| match event {
+                Event::MouseForeignPty(state) => captured.borrow_mut().push(
+                    serde_json::to_value(
+                        crate::herdr::protocol::ControlCommand::mouse(state).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                Event::WriteBytesToPty { .. } => {
+                    panic!("foreign wheel input must use terminal.scroll")
+                }
+                _ => {}
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.model.lock().set_foreign_controlled();
+            view.foreign_controlled = true;
+            view.alt_scroll(
+                3,
+                Point::new(5, 12),
+                ModifiersState {
+                    alt: true,
+                    ..Default::default()
+                },
+                ctx,
+            );
+            view.alt_scroll(-2, Point::new(0, 0), Default::default(), ctx);
+            view.alt_scroll(0, Point::new(0, 0), Default::default(), ctx);
+            view.model.lock().set_forced_read_only(true);
+            view.alt_scroll(1, Point::new(0, 0), Default::default(), ctx);
+        });
+
+        assert_eq!(
+            *commands.borrow(),
+            vec![
+                serde_json::json!({"type":"terminal.scroll","direction":"up","lines":3,"source":"wheel","modifiers":4,"column":12,"row":5}),
+                serde_json::json!({"type":"terminal.scroll","direction":"down","lines":2,"source":"wheel","modifiers":0,"column":0,"row":0}),
+            ]
+        );
+    })
+}
+
+/// PageUp/PageDown on a mirrored pane forward to herdr with the page-key
+/// source (herdr then scrolls its own scrollback unless the inner program
+/// claimed page keys), sized to the pane's viewport like herdr's native
+/// client — and never as raw `\x1b[5~`/`\x1b[6~` input.
+#[test]
+fn page_keys_forward_to_herdr_for_foreign_controlled_pane() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let scrolls: Rc<RefCell<Vec<(bool, u32, ScrollSource)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let captured_scrolls = scrolls.clone();
+        let captured_writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| match event {
+                Event::ScrollForeignPty { up, lines, source } => {
+                    captured_scrolls.borrow_mut().push((*up, *lines, *source));
+                }
+                Event::WriteBytesToPty { bytes } => {
+                    captured_writes.borrow_mut().push(bytes.to_vec());
+                }
+                _ => {}
+            });
+        });
+
+        let rows = terminal.update(&mut app, |view, ctx| {
+            view.model.lock().set_foreign_controlled();
+            view.foreign_controlled = true;
+            assert!(view.is_foreign_controlled());
+            let rows = view.size_info.rows as u32;
+            view.page_up(ctx);
+            view.page_down(ctx);
+            rows
+        });
+
+        assert_eq!(
+            *scrolls.borrow(),
+            vec![
+                (true, rows, ScrollSource::PageKey),
+                (false, rows, ScrollSource::PageKey),
+            ]
+        );
+        assert!(
+            pty_writes.borrow().is_empty(),
+            "foreign page keys must not be written as PTY input"
+        );
+    })
+}
+
+/// Non-foreign panes keep the existing behavior: page keys go to the PTY as
+/// escape sequences while a command runs, and no gesture produces a
+/// foreign-scroll event.
+#[test]
+fn scroll_gestures_do_not_forward_for_non_foreign_pane() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let scrolls: Rc<RefCell<Vec<(bool, u32, ScrollSource)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let pty_writes: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let captured_scrolls = scrolls.clone();
+        let captured_writes = pty_writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| match event {
+                Event::ScrollForeignPty { up, lines, source } => {
+                    captured_scrolls.borrow_mut().push((*up, *lines, *source));
+                }
+                Event::WriteBytesToPty { bytes } => {
+                    captured_writes.borrow_mut().push(bytes.to_vec());
+                }
+                _ => {}
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .simulate_long_running_block("sleep 20", "running");
+            view.page_up(ctx);
+            view.alt_scroll(3, Point::new(0, 0), Default::default(), ctx);
+        });
+
+        assert!(scrolls.borrow().is_empty());
+        assert!(
+            pty_writes.borrow().iter().any(|bytes| bytes == b"\x1b[5~"),
+            "page_up should still write the page-up escape to the PTY: {:?}",
+            pty_writes.borrow()
+        );
+    })
+}
+
+/// The foreign-scroll event projects into the PTY intent the terminal
+/// manager routes to the event loop.
+#[test]
+fn scroll_foreign_pty_event_maps_to_pty_intent() {
+    let event = Event::ScrollForeignPty {
+        up: true,
+        lines: 5,
+        source: ScrollSource::PageKey,
+    };
+    assert!(matches!(
+        event.pty_intent(),
+        Some(PtyIntent::Scroll {
+            up: true,
+            lines: 5,
+            source: ScrollSource::PageKey,
+        })
+    ));
+}
+
 #[test]
 fn cli_agent_rich_input_hint_text_mentions_active_cli_agent() {
     App::test((), |mut app| async move {
@@ -11008,4 +11674,62 @@ fn visible_bootstrap_block_leaves_focus_on_tab_group_rename_editor() {
             workspace.is_inline_rename_editor_focused(ctx)
         }));
     });
+}
+
+#[test]
+fn herdr_mouse_respects_shift_selection_read_only_and_reporting_setting() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let captured = commands.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| match event {
+                Event::MouseForeignPty(state) => captured.borrow_mut().push(
+                    serde_json::to_value(
+                        crate::herdr::protocol::ControlCommand::mouse(state).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                Event::WriteBytesToPty { .. } => {
+                    panic!("foreign mouse input must use terminal.mouse")
+                }
+                _ => {}
+            });
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.foreign_controlled = true;
+            view.model.lock().set_foreign_controlled();
+            let click =
+                MouseState::new(MouseButton::Left, MouseAction::Pressed, Default::default())
+                    .set_point(Point::new(2, 6));
+            view.alt_mouse_action(&click, ctx);
+            let shift_click = MouseState::new(
+                MouseButton::Left,
+                MouseAction::Pressed,
+                ModifiersState {
+                    shift: true,
+                    ..Default::default()
+                },
+            )
+            .set_point(Point::new(2, 6));
+            view.alt_mouse_action(&shift_click, ctx);
+            view.model.lock().set_forced_read_only(true);
+            view.alt_mouse_action(&click, ctx);
+            view.model.lock().set_forced_read_only(false);
+            AltScreenReporting::handle(ctx).update(ctx, |reporting, ctx| {
+                reporting
+                    .mouse_reporting_enabled
+                    .set_value(false, ctx)
+                    .unwrap();
+            });
+            view.alt_mouse_action(&click, ctx);
+        });
+        assert_eq!(
+            *commands.borrow(),
+            vec![
+                serde_json::json!({"type":"terminal.mouse","action":"down","button":"left","column":6,"row":2,"modifiers":0})
+            ]
+        );
+    })
 }

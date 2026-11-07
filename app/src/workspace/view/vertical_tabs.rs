@@ -66,6 +66,7 @@ use crate::terminal::{CLIAgent, TerminalView};
 use crate::themes::theme::Fill as ThemeFill;
 use crate::ui_components::agent_icon::terminal_view_agent_icon_variant;
 use crate::ui_components::buttons::combo_inner_button;
+use crate::ui_components::herdr_badge::{HERDR_BADGE_LABEL, render_herdr_badge};
 use crate::ui_components::icon_with_status::{IconWithStatusVariant, render_icon_with_status};
 use crate::ui_components::icons::Icon as UiIcon;
 use crate::util::bindings::keybinding_name_to_display_string;
@@ -411,6 +412,7 @@ fn render_pane_row_element(
         pane_rename_editor: _,
         is_pinned,
         container_is_hovered,
+        is_herdr_tab: _,
         shortcut_hint_binding_name: _,
     } = props;
     let is_selected = is_active_tab && is_focused;
@@ -857,6 +859,12 @@ struct PaneProps<'a> {
     /// True when the tab container containing this pane is hovered.
     /// The pin icon is hidden when a tab is hovered.
     container_is_hovered: bool,
+    /// Whether the tab this row belongs to is herdr-bound (mirrors a herdr
+    /// tab in herdr control mode). Drives the row's herdr badge and adds the
+    /// badge label to the row's search fragments. Set post-construction (like
+    /// `stack_position`) by every path that knows the tab: the sidebar row
+    /// render path, the search filters, and the detail sidecar.
+    is_herdr_tab: bool,
     shortcut_hint_binding_name: Option<&'static str>,
 }
 
@@ -1112,10 +1120,14 @@ fn summary_overflow_count(total_count: usize, visible_limit: usize) -> usize {
 fn summary_search_text_fragments(
     summary: &VerticalTabsSummaryData,
     title_override: Option<&str>,
+    is_herdr_tab: bool,
 ) -> Vec<String> {
     let mut fragments = Vec::new();
     if let Some(title_override) = title_override.and_then(normalize_summary_text) {
         fragments.push(title_override);
+    }
+    if is_herdr_tab {
+        fragments.push(HERDR_BADGE_LABEL.to_string());
     }
     fragments.extend(
         summary
@@ -1206,13 +1218,12 @@ impl VerticalTabsPanelState {
                     VerticalTabsResolvedMode::Summary => {
                         let summary =
                             build_vertical_tabs_summary_data(pane_group, &visible_pane_ids, app);
-                        search_fragments_contain_query(
-                            &summary_search_text_fragments(
-                                &summary,
-                                pane_group.custom_title(app).as_deref(),
-                            ),
-                            &query_lower,
-                        )
+                        let fragments = summary_search_text_fragments(
+                            &summary,
+                            pane_group.custom_title(app).as_deref(),
+                            tab.herdr_tab.is_some(),
+                        );
+                        search_fragments_contain_query(&fragments, &query_lower)
                     }
                     VerticalTabsResolvedMode::Panes | VerticalTabsResolvedMode::FocusedSession => {
                         pane_ids_for_display_granularity(
@@ -1250,6 +1261,7 @@ impl VerticalTabsPanelState {
                                 false,
                                 None,
                                 tab.pinned,
+                                tab.herdr_tab.is_some(),
                                 false,
                                 None,
                                 app,
@@ -1467,6 +1479,18 @@ fn render_detail_kind_badge_icon(
             if let Some(icon) = cli_agent_session.and_then(|session| session.agent.icon()) {
                 let color = cli_agent_session
                     .and_then(|session| session.agent.brand_color())
+                    .map(WarpThemeFill::Solid)
+                    .unwrap_or_else(|| theme.accent());
+                return icon.to_warpui_icon(color).finish();
+            }
+
+            // herdr control mode: mirrored agents never register an
+            // integration session; detect from the pane's command instead.
+            if let Some(agent) = terminal_view.foreign_controlled_cli_agent(app)
+                && let Some(icon) = agent.icon()
+            {
+                let color = agent
+                    .brand_color()
                     .map(WarpThemeFill::Solid)
                     .unwrap_or_else(|| theme.accent());
                 return icon.to_warpui_icon(color).finish();
@@ -1810,14 +1834,13 @@ fn render_groups(
                     VerticalTabsResolvedMode::Summary => {
                         let summary =
                             build_vertical_tabs_summary_data(pane_group, &visible_pane_ids, app);
-                        search_fragments_contain_query(
-                            &summary_search_text_fragments(
-                                &summary,
-                                pane_group.custom_title(app).as_deref(),
-                            ),
-                            &query_lower,
-                        )
-                        .then_some((tab_index, None))
+                        let fragments = summary_search_text_fragments(
+                            &summary,
+                            pane_group.custom_title(app).as_deref(),
+                            tab.herdr_tab.is_some(),
+                        );
+                        search_fragments_contain_query(&fragments, &query_lower)
+                            .then_some((tab_index, None))
                     }
                     VerticalTabsResolvedMode::Panes | VerticalTabsResolvedMode::FocusedSession => {
                         let title_override = (!uses_outer_group_container)
@@ -1858,6 +1881,7 @@ fn render_groups(
                                     false,
                                     None,
                                     tab.pinned,
+                                    tab.herdr_tab.is_some(),
                                     false,
                                     None,
                                     app,
@@ -1890,6 +1914,7 @@ fn render_groups(
                                 false,
                                 None,
                                 tab.pinned,
+                                tab.herdr_tab.is_some(),
                                 false,
                                 None,
                                 app,
@@ -2265,6 +2290,7 @@ fn render_tab_group_internal(
                     false,
                     None,
                     tab.pinned,
+                    tab.herdr_tab.is_some(),
                     group_state.is_hovered(),
                     tab_activate_binding_name(tab_index, workspace.tabs.len()),
                     app,
@@ -2325,6 +2351,7 @@ fn render_tab_group_internal(
                     is_pane_being_renamed,
                     is_pane_being_renamed.then_some(workspace.pane_rename_editor.clone()),
                     tab.pinned,
+                    tab.herdr_tab.is_some(),
                     group_state.is_hovered(),
                     tab_activate_binding_name(tab_index, workspace.tabs.len()),
                     app,
@@ -3490,12 +3517,14 @@ fn render_shortcut_hint(label: &str, appearance: &Appearance) -> Box<dyn Element
 /// `title` untouched when the row has no indicator to show.
 fn render_row_title_line(
     title: Box<dyn Element>,
+    is_herdr_tab: bool,
     shows_synced_inputs: bool,
     shows_activity_indicator: bool,
     shortcut_hint: Option<Box<dyn Element>>,
-    theme: &WarpTheme,
+    appearance: &Appearance,
 ) -> Box<dyn Element> {
-    if !shows_synced_inputs && !shows_activity_indicator && shortcut_hint.is_none() {
+    if !is_herdr_tab && !shows_synced_inputs && !shows_activity_indicator && shortcut_hint.is_none()
+    {
         return title;
     }
 
@@ -3503,11 +3532,14 @@ fn render_row_title_line(
         .with_main_axis_size(MainAxisSize::Min)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
         .with_spacing(4.);
+    if is_herdr_tab {
+        indicators.add_child(render_herdr_badge(appearance));
+    }
     if shows_synced_inputs {
         indicators.add_child(render_synced_inputs_indicator());
     }
     if shows_activity_indicator {
-        indicators.add_child(render_title_indicator(theme));
+        indicators.add_child(render_title_indicator(appearance.theme()));
     }
     if let Some(hint) = shortcut_hint {
         indicators.add_child(hint);
@@ -3556,50 +3588,33 @@ fn render_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
     } else {
         let has_indicator =
             props.typed.badge(app).is_some() || has_unread_activity(&props.typed, app);
-        let mut title_row = Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center);
-        title_row.add_child(
-            Shrinkable::new(
-                1.,
-                render_pane_title_slot(
-                    &props,
-                    || {
-                        Text::new_inline(props.displayed_title().to_string(), font_family, 12.)
-                            .with_clip(ClipConfig::ellipsis())
-                            .with_color(theme.main_text_color(theme.background()).into())
-                            .finish()
-                    },
-                    12.,
-                    theme.main_text_color(theme.background()),
-                    ClipConfig::ellipsis(),
-                    appearance,
-                    app,
-                ),
-            )
-            .finish(),
+        let title_row = render_row_title_line(
+            render_pane_title_slot(
+                &props,
+                || {
+                    Text::new_inline(props.displayed_title().to_string(), font_family, 12.)
+                        .with_clip(ClipConfig::ellipsis())
+                        .with_color(theme.main_text_color(theme.background()).into())
+                        .finish()
+                },
+                12.,
+                theme.main_text_color(theme.background()),
+                ClipConfig::ellipsis(),
+                appearance,
+                app,
+            ),
+            props.is_herdr_tab,
+            row_shows_synced_inputs_indicator(&props, app),
+            has_indicator,
+            shortcut_hint_label(&props, app).map(|label| render_shortcut_hint(&label, appearance)),
+            appearance,
         );
-        if has_indicator {
-            title_row.add_child(
-                Container::new(render_title_indicator(theme))
-                    .with_margin_left(4.)
-                    .finish(),
-            );
-        }
-        if let Some(label) = shortcut_hint_label(&props, app) {
-            title_row.add_child(
-                Container::new(render_shortcut_hint(&label, appearance))
-                    .with_margin_left(4.)
-                    .finish(),
-            );
-        }
 
         let mut content_col = Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Start)
             .with_spacing(2.)
-            .with_child(title_row.finish());
+            .with_child(title_row);
 
         if !effective_subtitle.is_empty() {
             let subtitle_clip = if matches!(props.typed, TypedPane::Code(_)) {
@@ -3935,6 +3950,7 @@ impl<'a> PaneProps<'a> {
         is_pane_being_renamed: bool,
         pane_rename_editor: Option<ViewHandle<EditorView>>,
         is_pinned: bool,
+        is_herdr_tab: bool,
         container_is_hovered: bool,
         shortcut_hint_binding_name: Option<&'static str>,
         app: &AppContext,
@@ -3991,6 +4007,7 @@ impl<'a> PaneProps<'a> {
             pane_rename_editor,
             is_pinned,
             container_is_hovered,
+            is_herdr_tab,
             shortcut_hint_binding_name,
         })
     }
@@ -4044,6 +4061,7 @@ impl<'a> PaneProps<'a> {
         pane_search_text_fragments(
             self.custom_vertical_tabs_title.as_deref(),
             generated_fragments,
+            self.is_herdr_tab,
         )
     }
 }
@@ -4186,6 +4204,7 @@ fn search_fragments_contain_query(fragments: &[String], query_lower: &str) -> bo
 fn pane_search_text_fragments(
     custom_title: Option<&str>,
     generated_fragments: Vec<String>,
+    is_herdr_tab: bool,
 ) -> Vec<String> {
     let mut fragments = Vec::new();
     let mut seen = HashMap::new();
@@ -4194,6 +4213,11 @@ fn pane_search_text_fragments(
     }
     for fragment in generated_fragments {
         push_normalized_unique_summary_text(&mut fragments, &mut seen, &fragment);
+    }
+    // Herdr-bound rows render the herdr chip; make its label searchable so
+    // typing "herdr" in the sidebar finds every herdr-bound tab.
+    if is_herdr_tab {
+        push_normalized_unique_summary_text(&mut fragments, &mut seen, HERDR_BADGE_LABEL);
     }
     fragments
 }
@@ -4386,7 +4410,10 @@ fn terminal_agent_text(terminal_view: &TerminalView, app: &AppContext) -> Termin
 
     let mut agent_text = TerminalAgentText {
         is_oz_agent: is_ambient_agent,
-        cli_agent: cli_agent_session.map(|session| session.agent),
+        cli_agent: cli_agent_session
+            .map(|session| session.agent)
+            // herdr control mode: label mirrored panes by their reported agent.
+            .or_else(|| terminal_view.foreign_controlled_cli_agent(app)),
         ..Default::default()
     };
 
@@ -4649,10 +4676,11 @@ fn render_terminal_row_content(
 
     let first_line_element = render_row_title_line(
         first_line,
+        props.is_herdr_tab,
         row_shows_synced_inputs_indicator(props, app),
         has_unread_activity(&props.typed, app),
         shortcut_hint_label(props, app).map(|label| render_shortcut_hint(&label, appearance)),
-        theme,
+        appearance,
     );
 
     let mut content = Flex::column()
@@ -4940,10 +4968,11 @@ fn render_summary_tab_item(
     }
     text_col.add_child(render_row_title_line(
         title_region.finish(),
+        props.is_herdr_tab,
         row_shows_synced_inputs_indicator(&props, app),
         summary.has_unread_activity,
         shortcut_hint_label(&props, app).map(|label| render_shortcut_hint(&label, appearance)),
-        theme,
+        appearance,
     ));
 
     // Working-directory region.
@@ -5750,6 +5779,13 @@ fn compute_tab_group_color_mode(
     theme: &WarpTheme,
     app: &AppContext,
 ) -> TabGroupColorMode {
+    // A live herdr agent status colors the whole tab, above (never
+    // overwriting) the user's selection.
+    if let Some(color) = tab.herdr_status_color {
+        return TabGroupColorMode::Uniform(
+            color.to_ansi_color(&theme.terminal_colors().normal).into(),
+        );
+    }
     // A manual color override applies to the whole tab.
     if !matches!(tab.selected_color, SelectedTabColor::Unset) {
         return match tab.selected_color.resolve(tab.default_directory_color) {
@@ -6891,6 +6927,7 @@ fn detail_pane_props<'a>(
     pane_group: &'a PaneGroup,
     pane_group_id: EntityId,
     pane_id: PaneId,
+    is_herdr_tab: bool,
     app: &AppContext,
 ) -> Option<PaneProps<'a>> {
     let badge_mouse_states = state
@@ -6925,6 +6962,7 @@ fn detail_pane_props<'a>(
         false,
         None,
         false,
+        is_herdr_tab,
         false,
         None,
         app,
@@ -6999,13 +7037,20 @@ fn render_terminal_detail_section(
         .with_main_axis_size(MainAxisSize::Max)
         .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
         .with_cross_axis_alignment(CrossAxisAlignment::Center);
-    metadata_row.add_child(render_detail_badge(
+    let mut left_badges = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(4.);
+    left_badges.add_child(render_detail_badge(
         kind_label,
         Some(render_detail_kind_badge_icon(props, appearance, app)),
         None,
         text_colors.disabled,
         appearance,
     ));
+    if props.is_herdr_tab {
+        left_badges.add_child(render_herdr_badge(appearance));
+    }
+    metadata_row.add_child(left_badges.finish());
 
     let mut right_badges = Flex::row()
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -7279,6 +7324,7 @@ pub(super) fn render_detail_sidecar(
     let detail_overlay_state = state.detail_overlay_state.clone();
     let window_id = workspace.window_id;
 
+    let is_herdr_tab = tab.herdr_tab.is_some();
     let mut sections = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
     for (index, pane_id) in pane_ids.iter().enumerate() {
         let Some(props) = detail_pane_props(
@@ -7287,6 +7333,7 @@ pub(super) fn render_detail_sidecar(
             pane_group,
             active_target.pane_group_id(),
             *pane_id,
+            is_herdr_tab,
             app,
         ) else {
             state.clear_detail_sidecar();
@@ -7528,10 +7575,11 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
     // Title row with optional indicators
     let title_row = render_row_title_line(
         title_element,
+        props.is_herdr_tab,
         row_shows_synced_inputs_indicator(&props, app),
         has_indicator,
         shortcut_hint_label(&props, app).map(|label| render_shortcut_hint(&label, appearance)),
-        theme,
+        appearance,
     );
 
     // Assemble text column: title + optional subtitle

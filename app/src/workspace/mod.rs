@@ -740,6 +740,22 @@ pub fn init(app: &mut AppContext) {
         .with_custom_action(CustomAction::NewTerminalTab)
         .with_enabled(|| ContextFlag::CreateNewSession.is_enabled()),
         EditableBinding::new(
+            "workspace:attach_herdr_session",
+            BindingDescription::new("Attach herdr session"),
+            WorkspaceAction::AttachHerdrDefault,
+        )
+        .with_enabled(|| FeatureFlag::HerdrControlMode.is_enabled())
+        .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
+        .with_group(bindings::BindingGroup::Terminal.as_str()),
+        EditableBinding::new(
+            "workspace:detach_herdr_session",
+            BindingDescription::new("Detach herdr session"),
+            WorkspaceAction::DetachHerdrSession,
+        )
+        .with_enabled(|| FeatureFlag::HerdrControlMode.is_enabled())
+        .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
+        .with_group(bindings::BindingGroup::Terminal.as_str()),
+        EditableBinding::new(
             NEW_AGENT_TAB_BINDING_NAME,
             BindingDescription::new("New Agent Tab"),
             WorkspaceAction::AddAgentTab,

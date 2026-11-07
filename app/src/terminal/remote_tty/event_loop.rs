@@ -160,6 +160,9 @@ impl EventLoop {
                         EventLoopMessage::Shutdown
                         | EventLoopMessage::ShutdownForReplacement
                         | EventLoopMessage::ChildExited => {}
+                        // Scrollback is Warp-side for remote panes; only
+                        // foreign-controlled (herdr) panes produce Scroll.
+                        EventLoopMessage::Scroll { .. } | EventLoopMessage::Mouse(_) => {}
                     }
                 }
             })

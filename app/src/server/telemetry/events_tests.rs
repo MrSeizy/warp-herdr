@@ -1,4 +1,7 @@
+use serde_json::json;
 use warp_core::telemetry::TelemetryEventDesc;
+
+use super::TelemetryEvent;
 
 #[derive(Debug)]
 enum TelemetryEventPropertyError {
@@ -6,6 +9,24 @@ enum TelemetryEventPropertyError {
     // below fails.
     EmptyName(#[expect(dead_code)] Box<dyn TelemetryEventDesc>),
     EmptyDescription(#[expect(dead_code)] Box<dyn TelemetryEventDesc>),
+}
+
+#[test]
+fn herdr_session_attached_payload_contains_only_tab_and_pane_counts() {
+    let event = TelemetryEvent::HerdrSessionAttached {
+        tab_count: 3,
+        pane_count: 5,
+    };
+
+    assert_eq!(
+        event.payload(),
+        Some(json!({
+            "tab_count": 3,
+            "pane_count": 5,
+        }))
+    );
+    assert!(!event.contains_ugc());
+    assert_eq!(event.name(), "Herdr.SessionAttached");
 }
 
 /// Checks that all telemetry events have a non-empty name and description.

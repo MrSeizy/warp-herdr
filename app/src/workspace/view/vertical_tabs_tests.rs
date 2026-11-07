@@ -8,8 +8,8 @@ use warpui::EntityId;
 use warpui::elements::PositionedElementOffsetBounds;
 
 use super::{
-    AgentTabTextPreference, SummaryPaneKind, SummaryPaneKindIcons, TerminalAgentText,
-    TerminalPrimaryLineData, TerminalPrimaryLineFont, VerticalTabsDetailTarget,
+    AgentTabTextPreference, HERDR_BADGE_LABEL, SummaryPaneKind, SummaryPaneKindIcons,
+    TerminalAgentText, TerminalPrimaryLineData, TerminalPrimaryLineFont, VerticalTabsDetailTarget,
     VerticalTabsDetailTargetKind, VerticalTabsSummaryBranchEntry, VerticalTabsSummaryData,
     VerticalTabsSummaryPrimaryLabel, branch_label_display, coalesce_summary_branch_entries,
     code_detail_kind_label, compact_branch_subtitle_display, detail_sidecar_width_and_bounds,
@@ -852,6 +852,7 @@ fn pane_search_fragments_prepend_custom_title_and_keep_generated_metadata() {
             "~/warp".to_string(),
             "Claude".to_string(),
         ],
+        false,
     );
 
     assert_eq!(fragments[0], "Production API");
@@ -871,9 +872,32 @@ fn pane_search_fragments_dedupe_custom_title_against_generated_text() {
                 "~/warp".to_string(),
                 "~/warp".to_string(),
             ],
+            false,
         ),
         vec!["Production API".to_string(), "~/warp".to_string()]
     );
+}
+
+#[test]
+fn pane_search_fragments_include_herdr_label_for_herdr_bound_tabs() {
+    // Herdr-bound rows render the herdr chip; its label is searchable so
+    // typing "herdr" in the sidebar finds every herdr-bound tab.
+    let fragments = pane_search_text_fragments(
+        None,
+        vec!["cargo nextest run".to_string(), "~/warp".to_string()],
+        true,
+    );
+
+    assert!(fragments.contains(&HERDR_BADGE_LABEL.to_string()));
+    assert!(search_fragments_contain_query(&fragments, "herdr"));
+    assert!(search_fragments_contain_query(&fragments, "cargo nextest"));
+}
+
+#[test]
+fn pane_search_fragments_omit_herdr_label_for_local_tabs() {
+    let fragments = pane_search_text_fragments(None, vec!["~/warp".to_string()], false);
+
+    assert!(!search_fragments_contain_query(&fragments, "herdr"));
 }
 
 #[test]
@@ -1235,7 +1259,7 @@ fn summary_search_fragments_include_hidden_overflow_values() {
         has_unread_activity: false,
     };
 
-    let fragments = summary_search_text_fragments(&summary, Some("Custom tab"));
+    let fragments = summary_search_text_fragments(&summary, Some("Custom tab"), false);
 
     assert!(search_fragments_contain_query(&fragments, "custom tab"));
     assert!(search_fragments_contain_query(&fragments, "claude"));
@@ -1244,6 +1268,10 @@ fn summary_search_fragments_include_hidden_overflow_values() {
     assert!(search_fragments_contain_query(&fragments, "#789"));
     assert!(search_fragments_contain_query(&fragments, "+2"));
     assert!(search_fragments_contain_query(&fragments, "-3"));
+    // A local tab must not match "herdr"; a herdr-bound tab must.
+    assert!(!search_fragments_contain_query(&fragments, "herdr"));
+    let herdr_fragments = summary_search_text_fragments(&summary, Some("Custom tab"), true);
+    assert!(search_fragments_contain_query(&herdr_fragments, "herdr"));
 }
 
 fn tab_group(name: Option<&str>) -> TabGroup {

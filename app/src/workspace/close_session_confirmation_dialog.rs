@@ -39,6 +39,15 @@ pub enum OpenDialogSource {
     },
 }
 
+/// Which stakes the dialog describes: a shared session ending for everyone,
+/// or a herdr-mirrored tab whose herdr-side panes are killed by the close.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub enum CloseSessionDialogCopy {
+    #[default]
+    SharedSession,
+    HerdrTab,
+}
+
 pub struct CloseSessionConfirmationDialog {
     cancel_mouse_state: MouseStateHandle,
     confirm_mouse_state: MouseStateHandle,
@@ -46,6 +55,7 @@ pub struct CloseSessionConfirmationDialog {
     dont_show_again: bool,
     // Source will be None if dialog was never opened, since there is no reasonable default
     open_confirmation_source: Option<OpenDialogSource>,
+    copy: CloseSessionDialogCopy,
 }
 
 #[allow(dead_code)]
@@ -57,10 +67,15 @@ impl CloseSessionConfirmationDialog {
             dont_show_again_mouse_state: Default::default(),
             open_confirmation_source: None,
             dont_show_again: false,
+            copy: CloseSessionDialogCopy::default(),
         }
     }
     pub fn set_open_confirmation_source(&mut self, source: OpenDialogSource) {
         self.open_confirmation_source = Some(source);
+    }
+
+    pub fn set_copy(&mut self, copy: CloseSessionDialogCopy) {
+        self.copy = copy;
     }
 
     pub fn get_open_confirmation_source(&self) -> Option<OpenDialogSource> {
@@ -99,11 +114,24 @@ impl View for CloseSessionConfirmationDialog {
             })
             .finish();
 
+        let (title, body, confirm_label) = match self.copy {
+            CloseSessionDialogCopy::SharedSession => (
+                "Close session?",
+                "You are about to close a session that is currently being shared. Closing it will end sharing for everyone.",
+                "Close session",
+            ),
+            CloseSessionDialogCopy::HerdrTab => (
+                "Close herdr tab?",
+                "This tab mirrors a herdr tab. Closing it also closes the tab in herdr, killing any agents running in its panes.",
+                "Close tab",
+            ),
+        };
+
         let dont_show_again_value = self.dont_show_again;
         let close_session_button = appearance
             .ui_builder()
             .button(ButtonVariant::Accent, self.confirm_mouse_state.clone())
-            .with_centered_text_label("Close session".into())
+            .with_centered_text_label(confirm_label.into())
             .with_style(button_style)
             .build()
             .with_cursor(Cursor::PointingHand)
@@ -128,11 +156,8 @@ impl View for CloseSessionConfirmationDialog {
 
         let dialog = Container::new(
             Dialog::new(
-                "Close session?".into(),
-                Some(
-                    "You are about to close a session that is currently being shared. Closing it will end sharing for everyone."
-                        .into(),
-                ),
+                title.into(),
+                Some(body.into()),
                 UiComponentStyles {
                     width: Some(460.),
                     padding: Some(Coords::uniform(24.)),
@@ -143,7 +168,7 @@ impl View for CloseSessionConfirmationDialog {
             .with_bottom_row_child(cancel_button)
             .with_bottom_row_child(close_session_button)
             .build()
-            .finish()
+            .finish(),
         )
         .with_margin_top(35.)
         .finish();

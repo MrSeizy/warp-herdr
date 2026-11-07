@@ -177,6 +177,9 @@ where
                 Message::Resize(size) => self.pty.on_resize(&size),
                 Message::ShutdownForReplacement => return ChannelResult::ReplaceShell,
                 Message::ChildExited => return ChannelResult::TerminateLoop { child_exited: true },
+                // Scrollback is Warp-side for local panes; only
+                // foreign-controlled (herdr) panes produce Scroll.
+                Message::Scroll { .. } | Message::Mouse(_) => {}
             }
         }
 

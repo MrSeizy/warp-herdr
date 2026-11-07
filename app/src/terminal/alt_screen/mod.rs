@@ -22,6 +22,11 @@ pub fn should_intercept_mouse(model: &TerminalModel, shift: bool, ctx: &AppConte
     let mouse_reporting_enabled = *AltScreenReporting::as_ref(ctx)
         .mouse_reporting_enabled
         .value();
+    if model.is_foreign_controlled() {
+        // Herdr's control stream does not expose the child's mouse mode. Let
+        // Herdr filter input against that mode; Shift above keeps local selection.
+        return !mouse_reporting_enabled;
+    }
     !(model.is_term_mode_set(TermMode::SGR_MOUSE) && mouse_tracking && mouse_reporting_enabled)
 }
 

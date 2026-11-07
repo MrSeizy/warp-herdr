@@ -40,6 +40,7 @@ pub mod find;
 pub mod general_settings;
 pub mod grid_renderer;
 pub mod grid_size_util;
+pub mod herdr_tty;
 pub mod history;
 pub mod input;
 pub mod keys;

@@ -27,6 +27,8 @@ pub struct SessionNavigationData {
     last_focus_ts: Option<NaiveDateTime>,
     /// Whether or not the session is in a read-only state.
     is_read_only: bool,
+    /// Another multiplexer (herdr) owns the process; it survives Warp.
+    is_foreign_controlled: bool,
     /// The sharing status of the session.
     shared_session_status: SharedSessionStatus,
 }
@@ -99,6 +101,7 @@ impl SessionNavigationData {
         pane_view_locator: PaneViewLocator,
         last_focus_ts: Option<NaiveDateTime>,
         is_read_only: bool,
+        is_foreign_controlled: bool,
         window_id: WindowId,
         shared_session_status: SharedSessionStatus,
     ) -> Self {
@@ -109,6 +112,7 @@ impl SessionNavigationData {
             pane_view_locator,
             last_focus_ts,
             is_read_only,
+            is_foreign_controlled,
             window_id,
             shared_session_status,
         }
@@ -140,6 +144,10 @@ impl SessionNavigationData {
 
     pub fn is_read_only(&self) -> bool {
         self.is_read_only
+    }
+
+    pub fn is_foreign_controlled(&self) -> bool {
+        self.is_foreign_controlled
     }
 
     pub fn shared_session_status(&self) -> SharedSessionStatus {
@@ -175,6 +183,8 @@ impl<'a> RunningSessionSummary<'a> {
                     CommandContext::RunningCommand { .. } | CommandContext::RunningAIBlock { .. }
                 ) && !session.shared_session_status().is_viewer()
                     && !session.is_read_only()
+                    // herdr mirrors survive Warp closing — nothing to lose
+                    && !session.is_foreign_controlled()
             })
             .collect();
         Self { long_running_cmds }
@@ -244,3 +254,7 @@ pub struct TabNavigationData {
     /// The tab's color, if one has been set by the user.
     pub color: Option<AnsiColorIdentifier>,
 }
+
+#[cfg(test)]
+#[path = "session_management_tests.rs"]
+mod tests;

@@ -321,6 +321,7 @@ impl AltScreenElement {
         &self,
         local_position: Vector2F,
         is_synthetic: bool,
+        modifiers: ModifiersState,
         app: &AppContext,
         ctx: &mut EventContext,
     ) -> bool {
@@ -357,13 +358,20 @@ impl AltScreenElement {
         // For alt-screen PTY purposes, we ignore synthetic mouse events!
         // This is especially relevant for mouse drags - we do not want mouse moved
         // events being handled at the same time as mouse dragged events.
-        if !is_synthetic && self.model.lock().is_term_mode_set(TermMode::MOUSE_MOTION) {
+        let report_motion = {
+            let model = self.model.lock();
+            if model.is_foreign_controlled() {
+                !should_intercept_mouse(&model, modifiers.shift, app)
+            } else {
+                model.is_term_mode_set(TermMode::MOUSE_MOTION)
+            }
+        };
+        if !is_synthetic && report_motion {
             // Note: it is counter-intuitive to use "pressed" as a state here for mouse hover motions, however,
             // we're largely just following standards from Alacritty/other terminals and the original terminal specs.
             // We intend to combine the mouse button and mouse action enums to avoid "weird" or "impossible" combinations,
             // see Linear issue at https://linear.app/warpdotdev/issue/CORE-1039/combine-the-mousebutton-and-mouseaction-enums-to-avoid-impossible.
-            let mouse_state =
-                MouseState::new(MouseButton::Move, MouseAction::Pressed, Default::default());
+            let mouse_state = MouseState::new(MouseButton::Move, MouseAction::Pressed, modifiers);
             ctx.dispatch_typed_action(TerminalAction::AltMouseAction(mouse_state.set_point(point)));
         }
 
@@ -451,6 +459,7 @@ impl AltScreenElement {
         local_position: Vector2F,
         delta: Vector2F,
         precise: bool,
+        modifiers: ModifiersState,
         ctx: &mut EventContext,
     ) -> bool {
         let cell_height = self.grid_render_params.size_info.cell_height_px;
@@ -479,7 +488,11 @@ impl AltScreenElement {
             .accumulate_lines_to_scroll(delta);
 
         let point = self.coord_to_point(local_position);
-        ctx.dispatch_typed_action(TerminalAction::AltScroll { delta, point });
+        ctx.dispatch_typed_action(TerminalAction::AltScroll {
+            delta,
+            point,
+            modifiers,
+        });
         true
     }
 
@@ -876,8 +889,10 @@ impl Element for AltScreenElement {
                 position,
                 delta,
                 precise,
-                modifiers: ModifiersState { ctrl: false, .. },
-            } if in_bounds => self.on_scroll(to_local(*position), *delta, *precise, ctx),
+                modifiers,
+            } if in_bounds && (!modifiers.ctrl || self.model.lock().is_foreign_controlled()) => {
+                self.on_scroll(to_local(*position), *delta, *precise, *modifiers, ctx)
+            }
             Event::LeftMouseDown {
                 position,
                 click_count,
@@ -934,10 +949,22 @@ impl Element for AltScreenElement {
             Event::MouseMoved {
                 position,
                 is_synthetic,
+                cmd,
+                shift,
                 ..
             } => {
                 if in_bounds {
-                    self.mouse_moved(to_local(*position), *is_synthetic, app, ctx)
+                    self.mouse_moved(
+                        to_local(*position),
+                        *is_synthetic,
+                        ModifiersState {
+                            cmd: *cmd,
+                            shift: *shift,
+                            ..Default::default()
+                        },
+                        app,
+                        ctx,
+                    )
                 } else {
                     self.mouse_out(ctx)
                 }

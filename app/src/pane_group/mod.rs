@@ -93,6 +93,8 @@ use crate::drive::items::WarpDriveItemId;
 use crate::drive::{CloudObjectTypeAndId, OpenWarpDriveObjectArgs};
 use crate::env_vars::EnvVarCollectionType;
 use crate::features::FeatureFlag;
+use crate::herdr::layout_convert::{HerdrPaneTree, warp_axis};
+use crate::herdr::protocol::HerdrSplitDirection;
 use crate::launch_configs::launch_config::{self, PaneMode, PaneTemplateType};
 use crate::notebooks::file::FileNotebookView;
 use crate::palette::PaletteMode;
@@ -124,6 +126,8 @@ use crate::terminal::available_shells::{AvailableShell, AvailableShells};
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::PluginModalKind;
 use crate::terminal::general_settings::{GeneralSettings, GeneralSettingsChangedEvent};
+use crate::terminal::herdr_tty::TerminalManager as HerdrTtyTerminalManager;
+use crate::terminal::herdr_tty::stream::HerdrStreamSpec;
 #[cfg(feature = "local_tty")]
 use crate::terminal::local_tty::TerminalManager as LocalTtyTerminalManager;
 #[cfg(all(feature = "local_tty", not(feature = "remote_tty")))]
@@ -489,6 +493,21 @@ pub fn init(app: &mut AppContext) {
 
 pub enum Event {
     AppStateChanged,
+    /// herdr control mode: the user asked to split a pane in a group that
+    /// mirrors a herdr tab. The workspace routes this to the herdr connection;
+    /// the response path materializes the new pane locally.
+    HerdrSplitRequested {
+        herdr_pane_id: String,
+        direction: HerdrSplitDirection,
+    },
+    /// herdr control mode: a pane in a group that mirrors a herdr tab was
+    /// closed locally. The workspace routes this to the herdr connection so
+    /// the pane also closes herdr-side. On the herdr-initiated path the map
+    /// entry is removed before `close_pane` runs, so this event only fires
+    /// for genuine user closes (or races where the entry still exists).
+    HerdrClosePaneRequested {
+        herdr_pane_id: String,
+    },
     Escape,
     Exited {
         add_to_undo_stack: bool,
@@ -852,6 +871,22 @@ pub enum PanesLayout {
     Snapshot(Box<PaneNodeSnapshot>),
     Template(PaneTemplateType),
     AmbientAgent,
+    /// herdr control mode: materialize this herdr split tree, one herdr_tty-
+    /// backed terminal pane per leaf.
+    Herdr(Box<HerdrPanesLayout>),
+}
+
+#[derive(Debug)]
+pub struct HerdrPanesLayout {
+    pub tree: HerdrPaneTree,
+    /// Same spec for every pane except `target`, which comes from the leaf.
+    pub base_spec: HerdrStreamSpec,
+    /// Channel on which each pane reports its stream closing (reason).
+    pub on_pane_closed: async_channel::Sender<(String, Option<String>)>,
+    /// Defer each pane's herdr stream subprocess instead of spawning it at
+    /// materialization; the spawn happens lazily on the tab's first view via
+    /// [`PaneGroup::attach_pending_herdr_streams`].
+    pub defer_stream: bool,
 }
 
 impl Default for PanesLayout {
@@ -879,6 +914,18 @@ pub struct PaneGroup {
     pane_history: Vec<PaneId>,
     /// Mapping from pane IDs to their contents.
     pane_contents: HashMap<PaneId, Box<dyn AnyPaneContent>>,
+    /// herdr control mode: herdr pane id → local pane, for groups whose tab
+    /// mirrors a herdr tab.
+    herdr_pane_ids: HashMap<String, PaneId>,
+    /// herdr control mode: pane currently being closed by `herdr_close_pane`.
+    /// Its mapping stays in `herdr_pane_ids` through `close_pane` (so the
+    /// herdr checks there see a mirrored pane) while this suppresses the
+    /// close-requested echo back to herdr.
+    herdr_close_in_progress: Option<PaneId>,
+    /// herdr control mode: whether the skipped-layout-sync WARN already
+    /// fired for the group's current degradation (hidden/foreign panes).
+    /// Reset when a sync's guards pass again.
+    herdr_sync_skip_warned: bool,
 
     server_api: Arc<ServerApi>,
 
@@ -1508,6 +1555,687 @@ impl PaneGroup {
                     focus,
                 )
             }
+        }
+    }
+
+    /// Materializes a herdr tab's split tree: one herdr_tty-backed terminal
+    /// pane per leaf. Modeled on `pane_tree_from_template`.
+    #[allow(clippy::too_many_arguments)]
+    fn pane_tree_from_herdr(
+        layout: HerdrPanesLayout,
+        resources: TerminalViewResources,
+        ctx: &mut ViewContext<PaneGroup>,
+        pane_contents: &mut HashMap<PaneId, Box<dyn AnyPaneContent>>,
+        user_default_shell_unsupported_banner_model_handle: ModelHandle<BannerState>,
+        view_size: Vector2F,
+        model_event_sender: Option<SyncSender<ModelEvent>>,
+        herdr_pane_map: &mut Vec<(String, PaneId)>,
+    ) -> (PaneData, InitialFocus) {
+        let HerdrPanesLayout {
+            tree,
+            base_spec,
+            on_pane_closed,
+            defer_stream,
+        } = layout;
+        let mut first_pane = None;
+        // The initial materialization is a sync against an empty reuse map:
+        // every leaf creates.
+        let pane_data = Self::pane_data_from_herdr(
+            &tree,
+            &base_spec,
+            &on_pane_closed,
+            defer_stream,
+            resources,
+            ctx,
+            pane_contents,
+            &user_default_shell_unsupported_banner_model_handle,
+            view_size,
+            &model_event_sender,
+            &HashMap::new(),
+            herdr_pane_map,
+            &mut first_pane,
+        );
+        // Focus the leftmost herdr pane; herdr-side focus syncs later.
+        let initial_focus = first_pane
+            .map(|leftmost| InitialFocus {
+                focused_pane: Some(leftmost.pane_id),
+                active_session: Some(leftmost.session_id),
+            })
+            .unwrap_or_default();
+        (pane_data, initial_focus)
+    }
+
+    /// Finalizes one pane's spawn spec from the session-wide base.
+    fn finalize_herdr_spec(
+        base_spec: &HerdrStreamSpec,
+        herdr_pane_id: &str,
+        cwd: Option<String>,
+        agent: Option<String>,
+        agent_status: crate::herdr::protocol::AgentStatus,
+    ) -> HerdrStreamSpec {
+        let mut spec = base_spec.clone();
+        spec.target = herdr_pane_id.to_string();
+        spec.cwd = cwd;
+        spec.agent = agent;
+        spec.agent_status = agent_status;
+        spec
+    }
+
+    /// Routes one pane's close reason to the connection with the pane's
+    /// herdr id attached: returns the sender the pane reports on. Errors
+    /// are dropped (the connection may already be gone).
+    fn route_pane_close_reason(
+        ctx: &mut ViewContext<PaneGroup>,
+        on_pane_closed: &async_channel::Sender<(String, Option<String>)>,
+        herdr_pane_id: &str,
+    ) -> async_channel::Sender<Option<String>> {
+        let (tx, rx) = async_channel::unbounded::<Option<String>>();
+        let outer = on_pane_closed.clone();
+        let id = herdr_pane_id.to_string();
+        ctx.spawn_stream_local(
+            rx,
+            move |_, reason, _| {
+                let _ = outer.try_send((id.clone(), reason));
+            },
+            |_, _| {},
+        );
+        tx
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_herdr_pane(
+        herdr_pane_id: &str,
+        cwd: &Option<String>,
+        agent: &Option<String>,
+        agent_status: crate::herdr::protocol::AgentStatus,
+        base_spec: &HerdrStreamSpec,
+        on_pane_closed: &async_channel::Sender<(String, Option<String>)>,
+        defer_stream: bool,
+        resources: TerminalViewResources,
+        ctx: &mut ViewContext<PaneGroup>,
+        pane_contents: &mut HashMap<PaneId, Box<dyn AnyPaneContent>>,
+        user_default_shell_unsupported_banner_model_handle: &ModelHandle<BannerState>,
+        view_size: Vector2F,
+        model_event_sender: &Option<SyncSender<ModelEvent>>,
+        first_pane: &mut Option<LeftmostPaneId>,
+        herdr_pane_map: &mut Vec<(String, PaneId)>,
+    ) -> PaneId {
+        let spec = Self::finalize_herdr_spec(
+            base_spec,
+            herdr_pane_id,
+            cwd.clone(),
+            agent.clone(),
+            agent_status,
+        );
+        let tx = Self::route_pane_close_reason(ctx, on_pane_closed, herdr_pane_id);
+        let uuid = Uuid::new_v4();
+        let init = HerdrTtyTerminalManager::create_model(
+            resources.clone(),
+            view_size,
+            model_event_sender.clone(),
+            ctx.window_id(),
+            spec,
+            tx,
+            defer_stream,
+            ctx,
+        );
+        let (view, manager, attached_to_herdr) = match init {
+            Ok(init) => (init.view, init.manager, true),
+            Err(err) => {
+                report_error!(err.context("herdr pane attach failed"));
+                // Fall back to a plain local terminal pane so the tree stays
+                // sound. The fallback is deliberately NOT registered in
+                // herdr_pane_ids below: herdr-routed operations must never
+                // target a user's local shell.
+                let (view, manager) = Self::create_session(
+                    cwd.as_ref().map(PathBuf::from),
+                    HashMap::new(),
+                    uuid.as_bytes(),
+                    IsSharedSessionCreator::No,
+                    resources,
+                    None,
+                    None,
+                    user_default_shell_unsupported_banner_model_handle.clone(),
+                    view_size,
+                    model_event_sender.clone(),
+                    None,
+                    None,
+                    ctx,
+                );
+                (view, manager, false)
+            }
+        };
+        let pane_data = TerminalPane::new(
+            uuid.as_bytes().to_vec(),
+            manager,
+            view,
+            model_event_sender.clone(),
+            ctx,
+        );
+        let terminal_pane_id = pane_data.terminal_pane_id();
+        let pane_id: PaneId = terminal_pane_id.into();
+        pane_contents.insert(pane_id, Box::new(pane_data));
+        if attached_to_herdr {
+            herdr_pane_map.push((herdr_pane_id.to_string(), pane_id));
+        }
+        if first_pane.is_none() {
+            *first_pane = Some(LeftmostPaneId {
+                pane_id,
+                session_id: terminal_pane_id,
+            });
+        }
+        pane_id
+    }
+
+    /// Builds the [`PaneData`] tree for a herdr split tree — the initial
+    /// materialization ([`PaneGroup::pane_tree_from_herdr`], empty reuse
+    /// map) and the live resync ([`PaneGroup::sync_herdr_layout`]) share
+    /// this one builder so the axis/flex/divider mapping can't drift.
+    /// Leaves resolve through `herdr_pane_ids`: a herdr pane already
+    /// mirrored keeps its live [`PaneId`] (restructuring must never
+    /// recreate its view); only a herdr pane id seen for the first time
+    /// goes through [`PaneGroup::create_herdr_pane`], honoring its
+    /// local-shell fallback and registering into `newly_registered`.
+    /// `first_pane` reports the leftmost created pane for initial focus;
+    /// the resync passes a throwaway (it derives focus from the finished
+    /// tree).
+    #[allow(clippy::too_many_arguments)]
+    fn pane_data_from_herdr(
+        tree: &HerdrPaneTree,
+        base_spec: &HerdrStreamSpec,
+        on_pane_closed: &async_channel::Sender<(String, Option<String>)>,
+        defer_stream: bool,
+        resources: TerminalViewResources,
+        ctx: &mut ViewContext<PaneGroup>,
+        pane_contents: &mut HashMap<PaneId, Box<dyn AnyPaneContent>>,
+        user_default_shell_unsupported_banner_model_handle: &ModelHandle<BannerState>,
+        view_size: Vector2F,
+        model_event_sender: &Option<SyncSender<ModelEvent>>,
+        herdr_pane_ids: &HashMap<String, PaneId>,
+        newly_registered: &mut Vec<(String, PaneId)>,
+        first_pane: &mut Option<LeftmostPaneId>,
+    ) -> PaneData {
+        match tree {
+            HerdrPaneTree::Leaf {
+                pane_id,
+                cwd,
+                agent,
+                agent_status,
+            } => {
+                let id = match herdr_pane_ids.get(pane_id) {
+                    Some(id) => *id,
+                    None => Self::create_herdr_pane(
+                        pane_id,
+                        cwd,
+                        agent,
+                        *agent_status,
+                        base_spec,
+                        on_pane_closed,
+                        defer_stream,
+                        resources,
+                        ctx,
+                        pane_contents,
+                        user_default_shell_unsupported_banner_model_handle,
+                        view_size,
+                        model_event_sender,
+                        first_pane,
+                        newly_registered,
+                    ),
+                };
+                PaneData::new(id)
+            }
+            HerdrPaneTree::Split {
+                direction,
+                children,
+            } => {
+                let axis = warp_axis(*direction);
+                let divider = tree::get_divider_thickness();
+                let mut nodes = Vec::with_capacity(children.len());
+                let mut len = 0;
+                for (flex, child) in children.iter() {
+                    let child_size = match axis {
+                        SplitDirection::Horizontal => {
+                            vec2f((view_size.x() - divider) * flex, view_size.y())
+                        }
+                        SplitDirection::Vertical => {
+                            vec2f(view_size.x(), (view_size.y() - divider) * flex)
+                        }
+                    };
+                    let child_data = Self::pane_data_from_herdr(
+                        child,
+                        base_spec,
+                        on_pane_closed,
+                        defer_stream,
+                        resources.clone(),
+                        ctx,
+                        pane_contents,
+                        user_default_shell_unsupported_banner_model_handle,
+                        child_size,
+                        model_event_sender,
+                        herdr_pane_ids,
+                        newly_registered,
+                        first_pane,
+                    );
+                    len += child_data.len();
+                    nodes.push((PaneFlex(*flex), child_data.root));
+                }
+                PaneData::new_branch(axis, nodes, len)
+            }
+        }
+    }
+
+    /// True when this group hosts the given herdr pane.
+    pub fn herdr_has_pane(&self, herdr_pane_id: &str) -> bool {
+        self.herdr_pane_ids.contains_key(herdr_pane_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_herdr_pane_for_test(&mut self, herdr_pane_id: &str, pane_id: PaneId) {
+        self.herdr_pane_ids
+            .insert(herdr_pane_id.to_string(), pane_id);
+    }
+
+    /// The herdr pane id mirrored by the given local pane, if any.
+    pub fn herdr_pane_id_of(&self, pane_id: PaneId) -> Option<&str> {
+        self.herdr_pane_ids
+            .iter()
+            .find(|(_, id)| **id == pane_id)
+            .map(|(herdr_id, _)| herdr_id.as_str())
+    }
+
+    /// Attaches this group's deferred herdr stream subprocesses. Panes
+    /// materialized with `defer_stream` (their tab was built inactive) carry
+    /// no `herdr terminal session control` subprocess until their tab is
+    /// first viewed; the workspace calls this when the tab activates.
+    /// Idempotent and cheap once everything is attached: already-attached
+    /// panes are skipped via `has_pending_stream`, and non-herdr contents
+    /// (e.g. local-shell fallback panes) are ignored.
+    pub fn attach_pending_herdr_streams(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.herdr_pane_ids.is_empty() {
+            return;
+        }
+        let pane_ids: Vec<PaneId> = self.herdr_pane_ids.values().copied().collect();
+        let mut attached = 0;
+        for pane_id in pane_ids {
+            let Some(session) = self.terminal_session_by_id(pane_id) else {
+                continue;
+            };
+            let manager = session.terminal_manager(ctx);
+            let manager = manager.as_ref(ctx);
+            let Some(herdr_manager) = manager.as_any().downcast_ref::<HerdrTtyTerminalManager>()
+            else {
+                continue;
+            };
+            if !herdr_manager.has_pending_stream() {
+                continue;
+            }
+            herdr_manager.ensure_stream_attached();
+            attached += 1;
+        }
+        if attached > 0 {
+            log::debug!("herdr: attaching {attached} deferred stream(s) on tab activation");
+        }
+    }
+
+    /// Restarts the dead `herdr terminal session control` subprocess of the
+    /// pane mirroring `herdr_pane_id` (see `TerminalManager::restart_stream`
+    /// for the retry budget). The pane and its last frame survive the
+    /// respawn — no tab churn. False when the pane is untracked or not
+    /// herdr_tty-backed (e.g. a local-shell fallback pane has no stream to
+    /// restart) and once the manager's restart budget is exhausted; the
+    /// caller then falls back to closing the pane.
+    pub fn restart_herdr_stream(
+        &mut self,
+        herdr_pane_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(pane_id) = self.herdr_pane_ids.get(herdr_pane_id).copied() else {
+            return false;
+        };
+        let Some(session) = self.terminal_session_by_id(pane_id) else {
+            return false;
+        };
+        let manager = session.terminal_manager(ctx);
+        let manager = manager.as_ref(ctx);
+        let Some(herdr_manager) = manager.as_any().downcast_ref::<HerdrTtyTerminalManager>() else {
+            return false;
+        };
+        herdr_manager.restart_stream()
+    }
+
+    /// Adds one herdr-backed pane (incremental split from a herdr
+    /// pane_created event). The new pane splits the tree root on the right
+    /// (`base_pane_id: None` → `split_root`), regardless of focus: the pane
+    /// must materialize immediately for liveness (its output needs somewhere
+    /// to render at once), and the follow-up layout refresh lands in
+    /// [`PaneGroup::sync_herdr_layout`], which corrects the exact
+    /// direction/ratio/structure to match herdr.
+    #[allow(clippy::too_many_arguments)]
+    pub fn herdr_split_pane(
+        &mut self,
+        herdr_pane_id: &str,
+        cwd: Option<String>,
+        agent: Option<String>,
+        agent_status: crate::herdr::protocol::AgentStatus,
+        base_spec: &HerdrStreamSpec,
+        on_pane_closed: &async_channel::Sender<(String, Option<String>)>,
+        defer_stream: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.herdr_pane_ids.contains_key(herdr_pane_id) {
+            return;
+        }
+        let spec = Self::finalize_herdr_spec(base_spec, herdr_pane_id, cwd, agent, agent_status);
+        let tx = Self::route_pane_close_reason(ctx, on_pane_closed, herdr_pane_id);
+        let uuid = Uuid::new_v4();
+        let resources = TerminalViewResources {
+            tips_completed: self.tips_completed.clone(),
+            server_api: self.server_api.clone(),
+            model_event_sender: self.model_event_sender.clone(),
+        };
+        let view_bounds = Self::estimated_view_bounds(ctx);
+        let init = HerdrTtyTerminalManager::create_model(
+            resources,
+            view_bounds.size(),
+            self.model_event_sender.clone(),
+            ctx.window_id(),
+            spec,
+            tx,
+            defer_stream,
+            ctx,
+        );
+        match init {
+            Ok(init) => {
+                let pane_data = TerminalPane::new(
+                    uuid.as_bytes().to_vec(),
+                    init.manager,
+                    init.view,
+                    self.model_event_sender.clone(),
+                    ctx,
+                );
+                let pane_id: PaneId = pane_data.terminal_pane_id().into();
+                // Call add_pane_with_options directly (with the same options
+                // add_pane builds) so machine-driven splits aren't attributed
+                // to the user via TelemetryEvent::SplitPane and don't mark
+                // the SplitPane tip used.
+                let added = self.add_pane_with_options(
+                    Box::new(pane_data),
+                    AddPaneOptions {
+                        direction: Direction::Right,
+                        base_pane_id: None,
+                        focus_new_pane: false,
+                        visibility: NewPaneVisibility::Visible,
+                        emit_app_state_changed: true,
+                    },
+                    ctx,
+                );
+                // Only track the pane once it's actually in the tree; a
+                // pre_attach veto drops it, and a stale entry here would
+                // permanently block a retry via the dedupe guard above.
+                if added.is_some() {
+                    self.herdr_pane_ids
+                        .insert(herdr_pane_id.to_string(), pane_id);
+                }
+            }
+            Err(err) => report_error!(err.context("herdr split attach failed")),
+        }
+    }
+
+    /// Applies a refreshed herdr layout to this live group, reconciling the
+    /// pane tree's direction, ratio, and structure with herdr's.
+    ///
+    /// The tree is rebuilt wholesale out of the EXISTING panes (keyed by
+    /// `herdr_pane_ids`), so terminal views are never recreated for panes
+    /// already mirrored; only herdr pane ids seen for the first time
+    /// materialize a new pane. herdr-tracked panes missing from the refreshed
+    /// tree are gone herdr-side and are closed locally. Focus is preserved
+    /// when the focused pane survives; otherwise the leftmost pane of the new
+    /// tree is focused, matching `pane_tree_from_herdr`.
+    pub fn sync_herdr_layout(
+        &mut self,
+        tree: &HerdrPaneTree,
+        base_spec: &HerdrStreamSpec,
+        on_pane_closed: &async_channel::Sender<(String, Option<String>)>,
+        defer_stream: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Guards: the wholesale rebuild below only supports pure, fully
+        // visible herdr mirrors. Hidden panes (undo-close, move, job, child
+        // agent) sit outside the tree structure herdr reports, and a foreign
+        // pane (e.g. a local shell the user split into the group, or a
+        // fallback pane whose herdr attach failed) has no herdr-side id to
+        // place — syncing would misplace or destroy them, so mixed/hidden
+        // groups are unsupported in v1 and the refresh is skipped.
+        if self.panes.num_hidden_panes() > 0 {
+            self.warn_herdr_sync_skipped("group has hidden panes");
+            return;
+        }
+        if self
+            .pane_contents
+            .keys()
+            .any(|pane_id| !self.herdr_pane_ids.values().any(|id| id == pane_id))
+        {
+            self.warn_herdr_sync_skipped("group has non-herdr panes");
+            return;
+        }
+        // Guards passed: a later degradation warns anew.
+        self.herdr_sync_skip_warned = false;
+
+        // herdr-tracked panes absent from the refreshed tree are gone
+        // herdr-side: close their local mirrors. Survivors and leftovers are
+        // computed BEFORE the build below registers newly seen panes —
+        // a just-registered pane must not count as an old-tree survivor.
+        let tree_pane_ids: HashSet<String> = tree.pane_ids().into_iter().collect();
+        let any_survivor = self
+            .herdr_pane_ids
+            .keys()
+            .any(|herdr_id| tree_pane_ids.contains(herdr_id));
+        let leftovers: Vec<(String, PaneId)> = self
+            .herdr_pane_ids
+            .iter()
+            .filter(|(herdr_id, _)| !tree_pane_ids.contains(*herdr_id))
+            .map(|(herdr_id, pane_id)| (herdr_id.clone(), *pane_id))
+            .collect();
+
+        // Build the target tree, reusing live panes for known herdr ids and
+        // materializing panes herdr reports for the first time. `defer_stream`
+        // only reaches those first-seen panes; reused panes keep whatever
+        // spawn state they already have.
+        let resources = TerminalViewResources {
+            tips_completed: self.tips_completed.clone(),
+            server_api: self.server_api.clone(),
+            model_event_sender: self.model_event_sender.clone(),
+        };
+        let view_size = Self::estimated_view_bounds(ctx).size();
+        let mut newly_registered = Vec::new();
+        let new_pane_data = Self::pane_data_from_herdr(
+            tree,
+            base_spec,
+            on_pane_closed,
+            defer_stream,
+            resources,
+            ctx,
+            &mut self.pane_contents,
+            &self.user_default_shell_unsupported_banner_model_handle,
+            view_size,
+            &self.model_event_sender,
+            &self.herdr_pane_ids,
+            &mut newly_registered,
+            // The resync derives focus from the finished tree; the
+            // leftmost-created-pane out-param is unused.
+            &mut None,
+        );
+        self.herdr_pane_ids.extend(newly_registered);
+
+        for (herdr_id, pane_id) in leftovers {
+            // The mapping is removed FIRST so the close is never routed back
+            // to herdr (which already destroyed the pane).
+            self.herdr_pane_ids.remove(&herdr_id);
+            if any_survivor {
+                // The same close path user closes use; a survivor keeps the
+                // group non-empty, so its last-pane-closes-the-tab path
+                // can't fire.
+                self.close_pane(pane_id, ctx);
+                // The mapping removal above makes the pane look non-herdr,
+                // so with undo-close enabled close_pane hides it for undo
+                // instead of destroying it. Force the definitive close:
+                // undo must not resurrect a pane herdr already destroyed
+                // (close_pane's own herdr bypass makes the same call).
+                if self.pane_contents.contains_key(&pane_id) {
+                    self.cleanup_closed_pane(pane_id, ctx);
+                }
+            } else {
+                // Every old pane is being replaced: close_pane's
+                // last-pane-closes-the-tab path would tear the tab down
+                // mid-swap, so close definitively instead. Focus is fixed up
+                // below once the new tree is in place.
+                self.discard_pane(pane_id, ctx);
+                self.remove_from_pane_history(pane_id);
+            }
+        }
+
+        // Preserve focus when the focused pane still exists in the new tree;
+        // otherwise fall back to the leftmost leaf.
+        let focused = self.focused_pane_id(ctx);
+        let new_leaf_ids = new_pane_data.pane_ids();
+        let focus_target = if new_leaf_ids.contains(&focused) {
+            None
+        } else {
+            new_leaf_ids.first().copied()
+        };
+
+        self.panes = new_pane_data;
+        // Any in-progress divider drag references dividers of the old tree.
+        self.dragged_border = None;
+        self.handle_pane_count_change(ctx);
+        if let Some(target) = focus_target {
+            // Machine-driven sync: reconcile the group's focus state without
+            // taking application focus.
+            self.focus_pane(target, false, ctx);
+        }
+        ctx.emit(Event::TerminalViewStateChanged);
+        ctx.emit(Event::AppStateChanged);
+        ctx.notify();
+    }
+
+    /// One-time (per degradation) WARN when a herdr layout sync is skipped:
+    /// the skip makes geometry desync permanent, and a stray local pane in a
+    /// mirrored group would otherwise freeze every future sync with only
+    /// debug logs to show for it.
+    fn warn_herdr_sync_skipped(&mut self, why: &str) {
+        if self.herdr_sync_skip_warned {
+            log::debug!("herdr: sync_herdr_layout skipped: {why}");
+            return;
+        }
+        self.herdr_sync_skip_warned = true;
+        log::warn!(
+            "herdr: sync_herdr_layout skipped: {why}; geometry stays frozen for this group until it contains only visible herdr panes again"
+        );
+    }
+
+    /// Closes the local pane mirroring the given herdr pane.
+    pub fn herdr_close_pane(&mut self, herdr_pane_id: &str, ctx: &mut ViewContext<Self>) {
+        let Some(pane_id) = self.herdr_pane_ids.get(herdr_pane_id).copied() else {
+            return;
+        };
+        // Keep the mapping in place through close_pane so its herdr checks
+        // see a mirrored pane (real destroy — never the undo-hide path — and
+        // an Exited that skips the undo stack), while suppressing the
+        // close-requested event: herdr initiated this close, and echoing it
+        // back could kill a live pane that re-used the id after a resync.
+        self.herdr_close_in_progress = Some(pane_id);
+        self.close_pane(pane_id, ctx);
+        self.herdr_close_in_progress = None;
+        self.herdr_pane_ids.remove(herdr_pane_id);
+    }
+
+    /// Sets the title of the local pane mirroring the given herdr pane: the
+    /// terminal model's natural title (what tab/pane labels read) plus the
+    /// pane header configuration.
+    pub fn herdr_set_pane_title(
+        &mut self,
+        herdr_pane_id: &str,
+        title: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(pane_id) = self.herdr_pane_ids.get(herdr_pane_id).copied() else {
+            return;
+        };
+        match self
+            .terminal_session_by_id(pane_id)
+            .map(|session| session.terminal_manager(ctx).as_ref(ctx).model())
+        {
+            Some(model) => {
+                use crate::terminal::model::ansi::Handler as _;
+                model.lock().set_title(Some(title.to_string()));
+                log::debug!("herdr: model title updated for pane {herdr_pane_id}");
+            }
+            None => log::warn!("herdr: no terminal model for pane {herdr_pane_id}"),
+        }
+        let Some(content) = self.pane_contents.get(&pane_id) else {
+            return;
+        };
+        let config = content.as_pane().pane_configuration();
+        let title = title.to_string();
+        config.update(ctx, |c, ctx| c.set_title(title, ctx));
+    }
+
+    /// Sets or clears the custom vertical-tabs title for the local pane
+    /// mirroring the given herdr pane.
+    pub fn herdr_set_pane_label(
+        &mut self,
+        herdr_pane_id: &str,
+        label: Option<&str>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(pane_id) = self.herdr_pane_ids.get(herdr_pane_id).copied() else {
+            return;
+        };
+        let Some(content) = self.pane_contents.get(&pane_id) else {
+            return;
+        };
+        let configuration = content.as_pane().pane_configuration();
+        configuration.update(ctx, |configuration, ctx| match label {
+            Some(label) => configuration.set_custom_vertical_tabs_title(label, ctx),
+            None => configuration.clear_custom_vertical_tabs_title(ctx),
+        });
+    }
+
+    /// Records the agent herdr reports for a mirrored pane on its terminal
+    /// model, where the sidebar icon renderer picks it up.
+    pub fn herdr_set_pane_agent(
+        &mut self,
+        herdr_pane_id: &str,
+        agent: Option<&str>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(pane_id) = self.herdr_pane_ids.get(herdr_pane_id).copied() else {
+            return;
+        };
+        match self
+            .terminal_session_by_id(pane_id)
+            .map(|session| session.terminal_manager(ctx).as_ref(ctx).model())
+        {
+            Some(model) => {
+                model.lock().set_foreign_agent(agent.map(str::to_owned));
+                ctx.notify();
+            }
+            None => log::warn!("herdr: no terminal model for pane {herdr_pane_id}"),
+        }
+        // Keep the pane's CLI agent session in sync so the CLI agent footer and
+        // Ctrl-G rich input work for mirrored panes; they never emit the
+        // shell-integration hooks local detection relies on. A live detection
+        // means the agent just started (or switched), so seed Working — the
+        // pane.agent_status_changed event that follows within herdr's
+        // detector cadence corrects it if the guess is wrong.
+        if let Some(view) = self.terminal_view_from_pane_id(pane_id, ctx) {
+            view.update(ctx, |view, ctx| {
+                view.sync_herdr_cli_agent_session(
+                    agent,
+                    crate::herdr::protocol::AgentStatus::Working,
+                    ctx,
+                )
+            });
         }
     }
 
@@ -3173,6 +3901,9 @@ impl PaneGroup {
             focus_state,
             pane_history,
             pane_contents,
+            herdr_pane_ids: HashMap::new(),
+            herdr_close_in_progress: None,
+            herdr_sync_skip_warned: false,
             server_api,
             terminal_with_open_share_block_modal: None,
             share_block_modal: share_modal,
@@ -3441,6 +4172,11 @@ impl PaneGroup {
         let pending_ambient = Rc::new(RefCell::new(Vec::new()));
         let pending_ambient_for_closure = pending_ambient.clone();
 
+        // Same trick for the herdr pane id map built while materializing a
+        // PanesLayout::Herdr tree.
+        let herdr_pane_map: Rc<RefCell<Vec<(String, PaneId)>>> = Rc::new(RefCell::new(Vec::new()));
+        let herdr_map_for_closure = herdr_pane_map.clone();
+
         let initial_layout = move |resources,
                                    pane_contents: &mut HashMap<PaneId, Box<dyn AnyPaneContent>>,
                                    pane_history: &mut Vec<PaneId>,
@@ -3508,6 +4244,16 @@ impl PaneGroup {
                     pane_history,
                     ctx,
                 ),
+                PanesLayout::Herdr(layout) => Self::pane_tree_from_herdr(
+                    *layout,
+                    resources,
+                    ctx,
+                    pane_contents,
+                    unsupported_banner_model_handle,
+                    view_bounds.size(),
+                    model_event_sender_clone,
+                    &mut herdr_map_for_closure.borrow_mut(),
+                ),
             }
         };
 
@@ -3525,6 +4271,11 @@ impl PaneGroup {
         let pending = pending_ambient.take();
         if !pending.is_empty() {
             pane_group.register_pending_ambient_restorations(pending, ctx);
+        }
+
+        let herdr_panes = herdr_pane_map.take();
+        if !herdr_panes.is_empty() {
+            pane_group.herdr_pane_ids = herdr_panes.into_iter().collect();
         }
 
         pane_group
@@ -4365,6 +5116,15 @@ impl PaneGroup {
         pane_id: &PaneId,
         ctx: &mut ViewContext<Self>,
     ) -> Option<Box<dyn AnyPaneContent>> {
+        // Mirrored herdr panes can't move between groups: the herdr id → pane
+        // mapping would stay behind in the source group while the pane lives
+        // in the destination, silently desyncing the mirror in both
+        // directions. Refuse the move instead.
+        if self.herdr_pane_id_of(*pane_id).is_some() {
+            log::warn!("herdr: refusing to move mirrored pane {pane_id:?} out of its group");
+            return None;
+        }
+
         // Clear any hidden pane entry since the pane is being permanently removed from this group.
         self.panes.remove_hidden_pane(*pane_id);
 
@@ -4763,6 +5523,29 @@ impl PaneGroup {
         discarded
     }
 
+    /// herdr control mode: asks the workspace to route this pane's close to
+    /// the herdr connection so the pane also closes herdr-side, then drops
+    /// the pane's herdr mapping. No-op for non-herdr panes and for
+    /// herdr-initiated closes (`herdr_close_in_progress` — herdr already
+    /// destroyed that pane; echoing the close back could kill a live pane
+    /// that re-used the id). Only called from the paths that actually remove
+    /// the pane — last-pane closes empty the tab and route `close_tab`
+    /// instead. The mapping is removed here (emit first, so the workspace
+    /// can still resolve the id) because the reconciler suppresses the
+    /// echoed close event, so `herdr_close_pane` never runs for
+    /// user-initiated closes.
+    fn emit_herdr_close_pane_requested(&mut self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
+        if self.herdr_close_in_progress == Some(pane_id) {
+            return;
+        }
+        if let Some(herdr_pane_id) = self.herdr_pane_id_of(pane_id).map(str::to_owned) {
+            ctx.emit(Event::HerdrClosePaneRequested {
+                herdr_pane_id: herdr_pane_id.clone(),
+            });
+            self.herdr_pane_ids.remove(&herdr_pane_id);
+        }
+    }
+
     pub fn close_pane(&mut self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
         // Don't close a pane that doesn't exist
         if !self.pane_contents.contains_key(&pane_id) {
@@ -4821,7 +5604,12 @@ impl PaneGroup {
             self.remove_child_agent_panes(terminal_view.id(), ctx);
         }
 
-        if FeatureFlag::UndoClosedPanes.is_enabled() {
+        // herdr-mirrored panes always close for real: the close is routed to
+        // herdr, which destroys the pane herdr-side, so hiding the pane for
+        // undo would let a restore resurrect a dead mirror.
+        let is_herdr_pane = self.herdr_pane_id_of(pane_id).is_some();
+
+        if FeatureFlag::UndoClosedPanes.is_enabled() && !is_herdr_pane {
             // Don't clase a pane that's already been hidden to allow for undo functionality
             if self.is_pane_hidden_for_close(pane_id) {
                 return;
@@ -4831,9 +5619,11 @@ impl PaneGroup {
                 // Tell the workspace that this pane group is now empty without
                 // doing any additional clean-up work.  This ensures we don't
                 // pre-emptively delete any state that we might want to retain
-                // if the user re-opens the closed tab.
+                // if the user re-opens the closed tab. The last pane of a
+                // herdr-bound group is torn down herdr-side too, so there is
+                // nothing to undo back to (mirrors herdr_close_tab).
                 ctx.emit(Event::Exited {
-                    add_to_undo_stack: true,
+                    add_to_undo_stack: self.herdr_pane_ids.is_empty(),
                 });
 
                 return;
@@ -4842,7 +5632,6 @@ impl PaneGroup {
             if let Some(pane_data) = self.pane_contents.get(&pane_id) {
                 let pane = pane_data.as_pane();
                 pane.detach(self, DetachType::HiddenForClose, ctx);
-
                 let pane_group_handle = ctx.handle();
                 UndoCloseStack::handle(ctx).update(ctx, |stack, ctx| {
                     stack.handle_pane_closed_by_id(pane_group_handle, pane_id, ctx);
@@ -4870,13 +5659,17 @@ impl PaneGroup {
                 // Tell the workspace that this pane group is now empty without
                 // doing any additional clean-up work.  This ensures we don't
                 // pre-emptively delete any state that we might want to retain
-                // if the user re-opens the closed tab.
+                // if the user re-opens the closed tab. The last pane of a
+                // herdr-bound group is torn down herdr-side too, so there is
+                // nothing to undo back to (mirrors herdr_close_tab).
                 ctx.emit(Event::Exited {
-                    add_to_undo_stack: true,
+                    add_to_undo_stack: self.herdr_pane_ids.is_empty(),
                 });
 
                 return;
             }
+
+            self.emit_herdr_close_pane_requested(pane_id, ctx);
 
             self.clean_up_pane(pane_id, ctx);
 
@@ -5137,6 +5930,30 @@ impl PaneGroup {
         }
     }
 
+    /// Asks herdr to split a mirrored pane. Returns whether the split was
+    /// routed to herdr instead of being created locally.
+    fn request_herdr_split(
+        &self,
+        pane_id: PaneId,
+        direction: Direction,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(herdr_pane_id) = self.herdr_pane_id_of(pane_id) else {
+            return false;
+        };
+        // The protocol only has Right/Down, so a Left/Up split materializes
+        // on the opposite side until herdr's layout corrects it.
+        let direction = match direction {
+            Direction::Right | Direction::Left => HerdrSplitDirection::Right,
+            Direction::Down | Direction::Up => HerdrSplitDirection::Down,
+        };
+        ctx.emit(Event::HerdrSplitRequested {
+            herdr_pane_id: herdr_pane_id.to_string(),
+            direction,
+        });
+        true
+    }
+
     /// Handle a common pane event, such as splitting off another pane.
     fn handle_pane_event(
         &mut self,
@@ -5149,22 +5966,31 @@ impl PaneGroup {
             PaneEvent::CloseAndFocus { pane_to_focus } => {
                 self.close_pane_and_focus(pane_id, *pane_to_focus, ctx);
             }
-            // Pane-splitting events always create a new terminal pane, regardless of the original
-            // pane's type. This makes it easy to get a terminal session next to a non-terminal
-            // pane like a notebook. Once it's possible to open the same notebook more than once,
-            // we may revisit this so that splitting from a terminal pane starts a new session, but
-            // splitting from a notebook pane reopens the notebook side-by-side.
+            // Herdr-mirrored terminal panes route splits through herdr. Other pane-splitting events
+            // create a new local terminal pane regardless of the original pane's type. This makes
+            // it easy to get a terminal session next to a non-terminal pane like a notebook. Once
+            // it's possible to open the same notebook more than once, we may revisit this so that
+            // splitting from a terminal pane starts a new session, but splitting from a notebook
+            // pane reopens the notebook side-by-side.
             PaneEvent::SplitLeft(chosen_shell) => {
-                self.insert_terminal_pane(Direction::Left, pane_id, chosen_shell.clone(), ctx);
+                if !self.request_herdr_split(pane_id, Direction::Left, ctx) {
+                    self.insert_terminal_pane(Direction::Left, pane_id, chosen_shell.clone(), ctx);
+                }
             }
             PaneEvent::SplitRight(chosen_shell) => {
-                self.insert_terminal_pane(Direction::Right, pane_id, chosen_shell.clone(), ctx);
+                if !self.request_herdr_split(pane_id, Direction::Right, ctx) {
+                    self.insert_terminal_pane(Direction::Right, pane_id, chosen_shell.clone(), ctx);
+                }
             }
             PaneEvent::SplitUp(chosen_shell) => {
-                self.insert_terminal_pane(Direction::Up, pane_id, chosen_shell.clone(), ctx);
+                if !self.request_herdr_split(pane_id, Direction::Up, ctx) {
+                    self.insert_terminal_pane(Direction::Up, pane_id, chosen_shell.clone(), ctx);
+                }
             }
             PaneEvent::SplitDown(chosen_shell) => {
-                self.insert_terminal_pane(Direction::Down, pane_id, chosen_shell.clone(), ctx);
+                if !self.request_herdr_split(pane_id, Direction::Down, ctx) {
+                    self.insert_terminal_pane(Direction::Down, pane_id, chosen_shell.clone(), ctx);
+                }
             }
             PaneEvent::ToggleMaximized => {
                 // The toggled pane might not be the active pane -- focus it first.
@@ -5257,6 +6083,14 @@ impl PaneGroup {
         if let Some(pane) = self.focused_pane_content(ctx) {
             pane.focus(ctx);
         }
+    }
+
+    /// [`Self::set_title`] without the refocus: herdr renames can target a
+    /// background tab, and focusing its unmounted pane strands keyboard
+    /// focus outside the Workspace binding context.
+    pub fn set_title_preserving_focus(&mut self, title: &str, ctx: &mut ViewContext<Self>) {
+        self.custom_title = Some(title.to_string()).filter(|t| !t.is_empty());
+        ctx.notify();
     }
 
     pub fn clear_title(&mut self, ctx: &mut ViewContext<Self>) {
@@ -8212,6 +9046,18 @@ impl TypedActionView for PaneGroup {
         use PaneGroupAction::*;
         match action {
             Add(direction) => {
+                // herdr-bound group: herdr creates the pane; the response path
+                // materializes it locally.
+                if !self.herdr_pane_ids.is_empty() {
+                    let focused = self.focused_pane_id(ctx);
+                    if self.request_herdr_split(focused, *direction, ctx) {
+                        return;
+                    }
+                    // The focused pane is foreign to herdr (e.g. a local
+                    // shell split into this group): fall through to a normal
+                    // local add. Nothing is routed to herdr and the new pane
+                    // is not tracked in herdr_pane_ids.
+                }
                 let chosen_shell = {
                     match self.active_session_terminal_model(ctx) {
                         Some(model) => {

@@ -9,6 +9,7 @@ pub(crate) mod breadcrumb;
 pub mod buttons;
 pub(crate) mod color_dot;
 pub(crate) mod dialog;
+pub(crate) mod herdr_badge;
 pub(crate) mod icon_with_status;
 pub(crate) mod item_highlight;
 pub mod json_tree;

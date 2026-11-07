@@ -84,6 +84,14 @@ pub fn wire_up_pty_controller_with_surface<T: EventLoopSender, S: TerminalSurfac
                     controller.resize_pty(size_update, ctx);
                 });
             }
+            PtyIntent::Scroll { up, lines, source } => {
+                controller.update(ctx, |controller, ctx| {
+                    controller.scroll_pty(up, lines, source, ctx);
+                });
+            }
+            PtyIntent::Mouse(state) => {
+                controller.update(ctx, |controller, ctx| controller.mouse_pty(state, ctx));
+            }
             PtyIntent::ExecuteCommand(event) => {
                 let Some(shell_type) = sessions
                     .as_ref(ctx)

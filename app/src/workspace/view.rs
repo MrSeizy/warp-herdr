@@ -10,6 +10,10 @@ mod crash_recovery;
 pub(crate) mod feature_intro_modal;
 pub(crate) mod free_ai_removal_modal;
 pub mod global_search;
+mod herdr;
+#[cfg(test)]
+#[path = "view_herdr_tests.rs"]
+mod herdr_tests;
 pub(crate) mod launch_modal;
 pub(crate) mod left_panel;
 pub(crate) mod onboarding;
@@ -137,7 +141,7 @@ use super::action::{
 use super::auto_handoff::AutoCloudHandoffController;
 pub(crate) use super::close_session_confirmation_dialog::OpenDialogSource;
 use super::close_session_confirmation_dialog::{
-    CloseSessionConfirmationDialog, CloseSessionConfirmationEvent,
+    CloseSessionConfirmationDialog, CloseSessionConfirmationEvent, CloseSessionDialogCopy,
 };
 use super::delete_conversation_confirmation_dialog::{
     DeleteConversationConfirmationDialog, DeleteConversationConfirmationEvent,
@@ -285,6 +289,8 @@ use crate::editor::{
 use crate::env_vars::CloudEnvVarCollection;
 use crate::env_vars::manager::{EnvVarCollectionManager, EnvVarCollectionSource};
 use crate::experiments::{BlockOnboarding, Experiment};
+use crate::herdr::connection::HerdrConnectionEvent;
+use crate::herdr::protocol::AgentStatus;
 use crate::launch_configs::launch_config::WindowTemplate;
 use crate::launch_configs::save_modal::{LaunchConfigModalEvent, LaunchConfigSaveModal};
 use crate::menu::{
@@ -1057,6 +1063,30 @@ pub struct Workspace {
     traffic_light_mouse_states: TrafficLightMouseStates,
     /// Tab groups in this workspace, keyed by id.
     pub(crate) tab_groups: HashMap<TabGroupId, TabGroup>,
+    /// herdr control mode: the attached session's connection, if any.
+    pub(crate) herdr_connection: Option<ModelHandle<crate::herdr::connection::HerdrConnection>>,
+    /// herdr control mode: herdr workspace id → local tab group.
+    pub(crate) herdr_group_ids: HashMap<String, TabGroupId>,
+    /// herdr control mode: true while an attach bootstrap is in flight, so a
+    /// second attach can't duplicate the session's mirrored tabs.
+    herdr_attach_in_progress: bool,
+    /// herdr control mode: nesting depth of materialization brackets (the
+    /// resync rebuild wraps the reconciler's per-tab brackets). While
+    /// non-zero, herdr_add_tab must not steal tab activation.
+    herdr_materializing_depth: usize,
+    /// Tab (by pane group id) that was active when the outermost herdr
+    /// materialization bracket began; kept active throughout it. Re-derived
+    /// if that tab is closed inside the bracket (resync teardown).
+    herdr_materializing_active_tab: Option<EntityId>,
+    /// herdr control mode: true while the attached session's connection is
+    /// down. Mirrored panes are forced read-only for the outage (see
+    /// set_herdr_panes_forced_read_only), and panes materialized mid-outage
+    /// pick the flag up as they appear.
+    herdr_disconnected: bool,
+    /// herdr control mode: true while herdr_apply_tab_order reorders mirrored
+    /// tabs to match a herdr-side move. The Warp→herdr move interception
+    /// checks this so the applied order doesn't echo straight back to herdr.
+    herdr_applying_remote_order: bool,
     /// Per-group hover state for the horizontal tab bar.
     horizontal_tab_group_mouse_states: RefCell<HashMap<TabGroupId, HorizontalTabGroupMouseStates>>,
     tab_rename_editor: ViewHandle<EditorView>,
@@ -1565,6 +1595,7 @@ impl Workspace {
             self.current_workspace_state.clear_tab_being_renamed();
             let title = self.tab_rename_editor.as_ref(ctx).buffer_text(ctx);
             let tab = &self.tabs[tab_index];
+            let mut renamed = false;
             tab.pane_group.update(ctx, |view, ctx| {
                 // Only update the title if it was actually changed. Otherwise, lets assume
                 // user's intend was to cancel the operation.
@@ -1574,8 +1605,12 @@ impl Workspace {
                         ctx
                     );
                     view.set_title(&title, ctx);
+                    renamed = true;
                 }
             });
+            if renamed {
+                self.mirror_tab_rename_to_herdr(tab_index, title.clone(), ctx);
+            }
             self.clear_tab_name_editor(ctx);
             self.update_window_title(ctx);
             ctx.notify();
@@ -3457,6 +3492,13 @@ impl Workspace {
             tab_bar_hover_state: Default::default(),
             traffic_light_mouse_states: Default::default(),
             tab_groups: HashMap::new(),
+            herdr_connection: None,
+            herdr_group_ids: HashMap::new(),
+            herdr_attach_in_progress: false,
+            herdr_materializing_depth: 0,
+            herdr_materializing_active_tab: None,
+            herdr_disconnected: false,
+            herdr_applying_remote_order: false,
             horizontal_tab_group_mouse_states: RefCell::default(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
             pane_rename_editor: Self::pane_rename_editor(ctx),
@@ -5521,6 +5563,25 @@ impl Workspace {
             self.set_active_tab_index(index, ctx);
             self.focus_active_tab(ctx);
             self.update_window_title(ctx);
+
+            // herdr control mode: mirror tab focus (one-way Warp→herdr).
+            if let Some(herdr_tab_id) = self.tabs.get(index).and_then(|t| t.herdr_tab.clone()) {
+                // Synthetic activations during bulk materialization (the
+                // flip-back to the pre-materialization tab) must not echo
+                // tab.focus to herdr: that tab is already herdr's focused
+                // tab, or is not herdr-bound at all.
+                if !self.herdr_materializing() {
+                    self.with_herdr_connection(ctx, move |conn, ctx| {
+                        conn.focus_tab(&herdr_tab_id, ctx)
+                    });
+                }
+                // First-view trigger: a herdr tab materialized while inactive
+                // carries panes whose stream subprocess was deferred; attach
+                // them now that the tab is being viewed. Cheap no-op once
+                // everything is attached.
+                let pane_group = self.tabs[index].pane_group.clone();
+                pane_group.update(ctx, |pg, ctx| pg.attach_pending_herdr_streams(ctx));
+            }
         }
     }
 
@@ -5736,8 +5797,9 @@ impl Workspace {
             ctx.notify();
             return;
         }
+        let title_changed = pane_group.as_ref(ctx).display_title(ctx) != title;
         pane_group.update(ctx, |pane_group, ctx| {
-            if pane_group.display_title(ctx) != title {
+            if title_changed {
                 pane_group.set_title(title, ctx);
                 send_telemetry_from_ctx!(
                     TelemetryEvent::TabRenamed(TabRenameEvent::CustomNameSet),
@@ -5745,6 +5807,9 @@ impl Workspace {
                 );
             }
         });
+        if title_changed {
+            self.mirror_tab_rename_to_herdr(self.active_tab_index, title.to_string(), ctx);
+        }
         ctx.notify();
     }
 
@@ -5796,7 +5861,7 @@ impl Workspace {
             );
             return;
         }
-        let next = if self.tabs[index].color() == Some(color) {
+        let next = if self.tabs[index].user_color() == Some(color) {
             if FeatureFlag::DirectoryTabColors.is_enabled() {
                 SelectedTabColor::Cleared
             } else {
@@ -5907,16 +5972,30 @@ impl Workspace {
             log::warn!("Tried to rename pane in a missing pane group");
             return;
         };
-        pane_group_view.update(ctx, |pane_group, ctx| {
-            let Some(pane) = pane_group.pane_by_id(locator.pane_id) else {
+        let herdr_pane_id = {
+            let pane_group = pane_group_view.as_ref(ctx);
+            if pane_group.pane_by_id(locator.pane_id).is_none() {
                 log::warn!("Tried to rename a missing pane");
                 return;
-            };
+            }
+            pane_group
+                .herdr_pane_id_of(locator.pane_id)
+                .map(str::to_string)
+        };
+        let label = match title.trim() {
+            "" => None,
+            label => Some(label.to_string()),
+        };
+        pane_group_view.update(ctx, |pane_group, ctx| {
+            let pane = pane_group.pane_by_id(locator.pane_id).unwrap();
             pane.pane_configuration().update(ctx, |configuration, ctx| {
                 configuration.set_custom_vertical_tabs_title(title, ctx);
             });
             ctx.emit(pane_group::Event::AppStateChanged);
         });
+        if let Some(herdr_pane_id) = herdr_pane_id {
+            self.mirror_pane_rename_to_herdr(herdr_pane_id, label, ctx);
+        }
     }
 
     pub fn clear_pane_name(&mut self, locator: PaneViewLocator, ctx: &mut ViewContext<Self>) {
@@ -5924,11 +6003,18 @@ impl Workspace {
             log::warn!("Tried to clear pane name in a missing pane group");
             return;
         };
-        pane_group_view.update(ctx, |pane_group, ctx| {
-            let Some(pane) = pane_group.pane_by_id(locator.pane_id) else {
+        let herdr_pane_id = {
+            let pane_group = pane_group_view.as_ref(ctx);
+            if pane_group.pane_by_id(locator.pane_id).is_none() {
                 log::warn!("Tried to clear a missing pane name");
                 return;
-            };
+            }
+            pane_group
+                .herdr_pane_id_of(locator.pane_id)
+                .map(str::to_string)
+        };
+        pane_group_view.update(ctx, |pane_group, ctx| {
+            let pane = pane_group.pane_by_id(locator.pane_id).unwrap();
             pane.pane_configuration().update(ctx, |configuration, ctx| {
                 configuration.clear_custom_vertical_tabs_title(ctx);
             });
@@ -5936,6 +6022,9 @@ impl Workspace {
         });
         ctx.dispatch_global_action("workspace:save_app", ());
         ctx.notify();
+        if let Some(herdr_pane_id) = herdr_pane_id {
+            self.mirror_pane_rename_to_herdr(herdr_pane_id, None, ctx);
+        }
     }
 
     pub fn rename_pane(&mut self, locator: PaneViewLocator, ctx: &mut ViewContext<Self>) {
@@ -7658,6 +7747,16 @@ impl Workspace {
         }
         let previous_group_id = tab.group_id;
 
+        // herdr control mode: moving a herdr-mirrored tab across groups is
+        // intentionally NOT mirrored to herdr — tab.move only reorders within
+        // a workspace, so a cross-group move has no herdr-side analog (the
+        // move interception in move_tab_to_index also skips it: the tab no
+        // longer sits in its own workspace's run). herdr keeps the tab at its
+        // old position.
+        if tab.herdr_tab.is_some() {
+            log::warn!("herdr: moving a mirrored tab across tab groups is not mirrored to herdr");
+        }
+
         let target_index = self.index_after_group(group_id).unwrap_or(self.tabs.len());
         self.tabs[tab_index].group_id = Some(group_id);
 
@@ -7725,6 +7824,12 @@ impl Workspace {
             }
         }
         self.tab_groups.remove(&group_id);
+        // herdr control mode: drop the workspace mapping when a herdr-backed
+        // group is ungrouped, or the next herdr_add_tab stamps new tabs with
+        // the dead group id (rendered ungrouped/mis-grouped for the rest of
+        // the attach — the heal in herdr_ensure_tab_group only runs when the
+        // reconciler re-ensures the workspace).
+        self.herdr_group_ids.retain(|_, gid| *gid != group_id);
 
         // If the group was pinned, we must reposition the group's
         // members after the pinned area. They are now ungrouped and
@@ -7756,6 +7861,19 @@ impl Workspace {
     /// of this group's run.
     fn new_tab_in_group(&mut self, group_id: TabGroupId, ctx: &mut ViewContext<Self>) {
         if !FeatureFlag::GroupedTabs.is_enabled() || !self.tab_groups.contains_key(&group_id) {
+            return;
+        }
+
+        // herdr control mode: a herdr-mirrored group creates the tab herdr-side;
+        // the tab.create response materializes the Warp tab.
+        if let Some((herdr_ws_id, _)) = self
+            .herdr_group_ids
+            .iter()
+            .find(|(_, gid)| **gid == group_id)
+            && self.herdr_connection.is_some()
+        {
+            let ws_id = herdr_ws_id.clone();
+            self.with_herdr_connection(ctx, move |conn, ctx| conn.create_tab(&ws_id, ctx));
             return;
         }
 
@@ -8000,10 +8118,19 @@ impl Workspace {
     /// Removes a tab group from the workspace if no tabs reference it.
     fn prune_empty_tab_group(&mut self, group_id: TabGroupId, ctx: &mut ViewContext<Self>) {
         let has_members = group_member_indices(&self.tabs, group_id).next().is_some();
-        if !has_members {
-            self.tab_groups.remove(&group_id);
-            ctx.notify();
+        if has_members {
+            return;
         }
+        // A group backing a herdr workspace survives empty stretches while
+        // attached: herdr_group_ids keeps mapping to it, so pruning here
+        // would leave a dangling id for the next mirrored tab.
+        let backs_herdr_workspace = self.herdr_connection.is_some()
+            && self.herdr_group_ids.values().any(|gid| *gid == group_id);
+        if backs_herdr_workspace {
+            return;
+        }
+        self.tab_groups.remove(&group_id);
+        ctx.notify();
     }
 
     /// Moves the tab at `from` to position `to` (`Vec::insert` semantics).
@@ -8023,6 +8150,11 @@ impl Workspace {
             return;
         }
 
+        // herdr control mode: the tab's position within its herdr workspace's
+        // group run before the move, so mirror_tab_move_to_herdr can fire only
+        // on a real within-run reorder.
+        let herdr_move_before = self.herdr_run_position(from);
+
         let active_pane_group_id = self
             .tabs
             .get(self.active_tab_index)
@@ -8040,6 +8172,100 @@ impl Workspace {
             self.active_tab_index = new_active;
         }
         ctx.notify();
+
+        // herdr control mode: mirror the settled move to herdr (no-op for
+        // local tabs, cross-group moves, and herdr-applied reorders).
+        self.mirror_tab_move_to_herdr(herdr_move_before, adjusted_to, ctx);
+    }
+
+    /// herdr control mode: mirrors a committed tab rename to herdr (one-way
+    /// Warp→herdr; no-op for plain local tabs). Every rename entry point
+    /// must route through this or herdr's copy of the label silently
+    /// desyncs — the sidebar pane-rename gesture once bypassed the mirror
+    /// and permanently masked herdr title pushes (see set_custom_pane_name).
+    fn mirror_tab_rename_to_herdr(
+        &mut self,
+        tab_index: usize,
+        label: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(herdr_tab_id) = self.tabs.get(tab_index).and_then(|t| t.herdr_tab.clone()) else {
+            return;
+        };
+        self.with_herdr_connection(ctx, move |conn, ctx| {
+            conn.rename_tab(&herdr_tab_id, &label, ctx)
+        });
+    }
+
+    fn mirror_pane_rename_to_herdr(
+        &mut self,
+        herdr_pane_id: String,
+        label: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.with_herdr_connection(ctx, move |conn, ctx| {
+            conn.rename_pane(&herdr_pane_id, label.as_deref(), ctx)
+        });
+    }
+
+    /// herdr control mode: when the tab at `tab_index` sits within its herdr
+    /// workspace's group run, returns its herdr tab id and 0-based index
+    /// within the run. None for plain local tabs and for herdr tabs outside
+    /// their own workspace's group (ungrouped, or pulled into a local or
+    /// another herdr workspace's group): those moves have no herdr-side
+    /// analog — tab.move only reorders within a workspace.
+    fn herdr_run_position(&self, tab_index: usize) -> Option<(String, usize)> {
+        let tab = self.tabs.get(tab_index)?;
+        let herdr_tab_id = tab.herdr_tab.clone()?;
+        let group_id = tab.group_id?;
+        // The owning workspace is stored alongside the marker rather than
+        // parsed out of the id (its format is herdr's business); only the
+        // tab's OWN workspace's run yields a meaningful tab.move index.
+        let workspace_id = tab.herdr_workspace.as_deref()?;
+        if self.herdr_group_ids.get(workspace_id).copied() != Some(group_id) {
+            return None;
+        }
+        let (first, _) = group_member_index_range(&self.tabs, group_id)?;
+        // herdr's tab.move index space contains only this workspace's tabs:
+        // count just the mirrored same-workspace members preceding this tab
+        // in the run — local tabs interleaved into the run (and tabs of
+        // other workspaces) don't exist herdr-side.
+        let run_index = self.tabs[first..tab_index]
+            .iter()
+            .filter(|t| t.herdr_tab.is_some() && t.herdr_workspace.as_deref() == Some(workspace_id))
+            .count();
+        Some((herdr_tab_id, run_index))
+    }
+
+    /// herdr control mode: mirrors a just-settled local tab move to herdr.
+    /// `before` is the moved tab's run position captured before the move (via
+    /// herdr_run_position); the tab is now at `moved_index`. Fires tab.move
+    /// only when the tab's position within its herdr workspace's run actually
+    /// changed, and never while applying a herdr-side order
+    /// (herdr_applying_remote_order) or materializing — those moves originate
+    /// from herdr and must not echo back.
+    fn mirror_tab_move_to_herdr(
+        &mut self,
+        before: Option<(String, usize)>,
+        moved_index: usize,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.herdr_applying_remote_order || self.herdr_materializing() {
+            return;
+        }
+        let Some((herdr_tab_id, before_index)) = before else {
+            return;
+        };
+        let Some((moved_id, after_index)) = self.herdr_run_position(moved_index) else {
+            return;
+        };
+        if moved_id != herdr_tab_id || after_index == before_index {
+            return;
+        }
+        log::debug!("herdr: mirroring tab move {herdr_tab_id} to index {after_index}");
+        self.with_herdr_connection(ctx, move |conn, ctx| {
+            conn.move_tab(herdr_tab_id, after_index, ctx)
+        });
     }
 
     /// Moves the tab at `from_index` so it ends up at `to_index`, sliding the
@@ -11693,7 +11919,15 @@ impl Workspace {
                 };
                 match *open_confirmation_source {
                     OpenDialogSource::CloseTab { tab_index } => {
-                        self.remove_tab(tab_index, true, true, ctx);
+                        // Route through close_tabs so herdr-bound tabs also
+                        // close herdr-side (remove_tab alone bypasses that).
+                        self.close_tabs(
+                            vec![tab_index].into_iter(),
+                            OpenDialogSource::CloseTab { tab_index },
+                            true,
+                            true,
+                            ctx,
+                        );
                     }
                     OpenDialogSource::ClosePane {
                         pane_group_id,
@@ -11903,10 +12137,16 @@ impl Workspace {
         } else {
             None
         };
-        let tabs: Vec<TabSnapshot> = self
+        let (kept_tab_indices, tabs): (Vec<usize>, Vec<TabSnapshot>) = self
             .tab_views()
             .enumerate()
             .filter(|(tab_index, _)| Some(*tab_index) != transferred_tab_index)
+            // herdr control-mode tabs live in herdr, not in Warp's session.
+            .filter(|(tab_index, _)| {
+                self.tabs
+                    .get(*tab_index)
+                    .is_none_or(|tab| tab.herdr_tab.is_none())
+            })
             .map(|(tab_index, pane_group_view)| {
                 let resizable_data = ResizableData::handle(app);
                 let modal_sizes = resizable_data.as_ref(app).get_all_handles(window_id);
@@ -11931,7 +12171,7 @@ impl Workspace {
                     self.compute_left_panel_snapshot(pane_group_view, left_panel_width, app);
                 let right_panel =
                     self.compute_right_panel_snapshot(pane_group_view, right_panel_width, app);
-                TabSnapshot {
+                let snapshot = TabSnapshot {
                     root,
                     custom_title: pane_group.custom_title(app),
                     default_directory_color: self
@@ -11954,9 +12194,10 @@ impl Workspace {
                     // enabled.
                     pinned: FeatureFlag::PinnedTabs.is_enabled()
                         && self.tabs.get(tab_index).is_some_and(|tab| tab.pinned),
-                }
+                };
+                (tab_index, snapshot)
             })
-            .filter(|tab| {
+            .filter(|(_, tab)| {
                 // Filter out any tab that contains a single, read-only session.
                 !matches!(
                     tab.root,
@@ -11969,7 +12210,22 @@ impl Workspace {
                     })
                 )
             })
-            .collect();
+            .unzip();
+
+        // The stored index addresses the FILTERED tab list: herdr tabs, a
+        // mid-drag placeholder, and single read-only sessions are not
+        // persisted, so the raw index would restore focus to the wrong tab
+        // whenever any filtered tab preceded the active one. When the active
+        // tab itself was filtered, fall back to its nearest persisted
+        // predecessor (else the first tab).
+        let active_tab_index = match kept_tab_indices.iter().position(|&i| i == active_tab_index) {
+            Some(stored) => stored,
+            None => kept_tab_indices
+                .iter()
+                .filter(|&&i| i < active_tab_index)
+                .count()
+                .saturating_sub(1),
+        };
 
         // Skip orphan groups whose members were all filtered out above.
         // This is a safety net and ensures empty groups are not saved/restored.
@@ -12408,6 +12664,22 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         let tab_indices_vec = tab_indices.collect_vec();
+        // Closing a herdr tab kills its remote panes; confirm unless the user
+        // turned the close confirmation off ("Don't show again"). The dialog's
+        // confirm path re-enters with skip_confirmation = true.
+        if !skip_confirmation && self.herdr_connection.is_some() {
+            let closing_herdr_tab = tab_indices_vec
+                .iter()
+                .any(|i| self.tabs.get(*i).is_some_and(|t| t.herdr_tab.is_some()));
+            if closing_herdr_tab && *SessionSettings::as_ref(ctx).should_confirm_close_session {
+                self.show_close_session_confirmation_dialog(
+                    dialog_source,
+                    CloseSessionDialogCopy::HerdrTab,
+                    ctx,
+                );
+                return false;
+            }
+        }
         // Check if there are any tabs that can't be closed without confirmation
         if !skip_confirmation && self.should_confirm_close_session(ctx) {
             for i in tab_indices_vec.iter() {
@@ -12415,7 +12687,11 @@ impl Workspace {
                     .get_pane_group_view(*i)
                     .is_some_and(|view| view.as_ref(ctx).is_terminal_pane_being_shared(ctx));
                 if is_tab_shared {
-                    self.show_close_session_confirmation_dialog(dialog_source, ctx);
+                    self.show_close_session_confirmation_dialog(
+                        dialog_source,
+                        CloseSessionDialogCopy::SharedSession,
+                        ctx,
+                    );
                     return false;
                 }
             }
@@ -12495,6 +12771,19 @@ impl Workspace {
 
         // Remove the tabs in reverse order to avoid indexing OOB.
         for i in tab_indices_vec.into_iter().sorted().rev() {
+            // herdr-bound tab: close it herdr-side too. The deferred call
+            // checks is_known_tab, so echoes of herdr-initiated closes (whose
+            // tabs the reconciler already forgot) become no-ops. During detach
+            // the connection is already gone, so herdr keeps its tabs.
+            let herdr_tab_id = self.tabs.get(i).and_then(|t| t.herdr_tab.clone());
+            // Undo would restore a ghost tab whose herdr-side tab and streams
+            // are gone, so herdr-bound tabs skip the undo stack.
+            let add_to_undo_stack = add_to_undo_stack && herdr_tab_id.is_none();
+            if let Some(herdr_tab_id) = herdr_tab_id {
+                self.with_herdr_connection(ctx, move |conn, ctx| {
+                    conn.close_tab(&herdr_tab_id, ctx)
+                });
+            }
             self.remove_tab(i, add_to_undo_stack, true, ctx);
         }
         true
@@ -14539,7 +14828,11 @@ impl Workspace {
         // `hop_tab_to_index` keeps the same tab active across the move, so we
         // only capture whether the moved tab was the active one for telemetry.
         let moving_active_tab = index == self.active_tab_index;
+        // herdr control mode: as in move_tab_to_index, capture the run
+        // position before the hop so the settled move mirrors to herdr.
+        let herdr_move_before = self.herdr_run_position(index);
         self.hop_tab_to_index(index, target, ctx);
+        self.mirror_tab_move_to_herdr(herdr_move_before, target, ctx);
 
         if moving_active_tab {
             send_telemetry_from_ctx!(TelemetryEvent::MoveActiveTab { direction }, ctx);
@@ -16305,6 +16598,20 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         match event {
+            pane_group::Event::HerdrSplitRequested {
+                herdr_pane_id,
+                direction,
+            } => {
+                let id = herdr_pane_id.clone();
+                let direction = *direction;
+                self.with_herdr_connection(ctx, move |conn, ctx| {
+                    conn.split_pane(&id, direction, ctx)
+                });
+            }
+            pane_group::Event::HerdrClosePaneRequested { herdr_pane_id } => {
+                let id = herdr_pane_id.clone();
+                self.with_herdr_connection(ctx, move |conn, ctx| conn.close_pane(&id, ctx));
+            }
             pane_group::Event::AppStateChanged => {
                 ctx.dispatch_global_action("workspace:save_app", ());
                 self.refresh_working_directories_for_pane_group(&pane_group, ctx);
@@ -16652,6 +16959,7 @@ impl Workspace {
                             pane_group_id: pane_group.id(),
                             pane_id: *pane_id,
                         },
+                        CloseSessionDialogCopy::SharedSession,
                         ctx,
                     );
                 } else {
@@ -18864,11 +19172,13 @@ impl Workspace {
     fn show_close_session_confirmation_dialog(
         &mut self,
         source: OpenDialogSource,
+        copy: CloseSessionDialogCopy,
         ctx: &mut ViewContext<Self>,
     ) {
         self.close_session_confirmation_dialog
             .update(ctx, |view, _| {
                 view.set_open_confirmation_source(source);
+                view.set_copy(copy);
             });
         self.current_workspace_state
             .is_close_session_confirmation_dialog_open = true;
@@ -24400,6 +24710,8 @@ impl TypedActionView for Workspace {
             AddAmbientAgentTab => self.add_ambient_agent_tab(ctx),
             AddAgentTab => self.add_terminal_tab_with_new_agent_view(ctx),
             AddDockerSandboxTab => self.add_docker_sandbox_tab(ctx),
+            AttachHerdrDefault => self.attach_herdr_default(ctx),
+            DetachHerdrSession => self.detach_herdr_session(ctx),
             StartAgentOnboardingTutorial(tutorial) => {
                 self.start_agent_onboarding_tutorial(tutorial.clone(), ctx)
             }
@@ -28296,6 +28608,16 @@ impl Workspace {
     /// if the index is out of bounds.
     fn tab_transfer_info_at_index(&self, index: usize, ctx: &AppContext) -> Option<TransferredTab> {
         let tab = self.tabs.get(index)?;
+        if tab.herdr_tab.is_some() {
+            // Cross-window transfer rebuilds TabData in the target window and
+            // would sever the herdr binding: no chip, no close/focus/move
+            // routing, and resync teardown misses the tab so the herdr-side
+            // tab leaks with no way to close it from Warp. Mirrored tabs stay
+            // in the window that owns the herdr connection; every caller
+            // treats None as "cannot transfer" and degrades to a local drag.
+            log::info!("herdr: refusing cross-window transfer of mirrored tab");
+            return None;
+        }
         let pane_group = tab.pane_group.clone();
         let color = tab.color();
         let draggable_state = tab.draggable_state.clone();
@@ -29133,7 +29455,11 @@ impl Workspace {
                 return;
             }
 
+            // herdr control mode: a within-run drag swap is a settled move —
+            // capture the run position before the swap and mirror it.
+            let herdr_move_before = self.herdr_run_position(current_index);
             self.tabs.swap(new_index, current_index);
+            self.mirror_tab_move_to_herdr(herdr_move_before, new_index, ctx);
 
             if current_index == self.active_tab_index {
                 self.set_active_tab_index(new_index, ctx);

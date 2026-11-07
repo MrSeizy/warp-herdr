@@ -259,6 +259,13 @@ pub enum WorkspaceAction {
     AddAgentTab,
     /// Add a new tab running a local Docker sandbox via `sbx`.
     AddDockerSandboxTab,
+    /// Attach to the default (or sole) discovered herdr session. A
+    /// parameterized variant for a session picker gets added when the picker
+    /// lands (`Workspace::attach_herdr_session` already takes name + path).
+    AttachHerdrDefault,
+    /// Detach the herdr session bound to this workspace (streams released,
+    /// herdr keeps running, tabs closed).
+    DetachHerdrSession,
     OpenNewSessionMenu {
         anchor: NewSessionMenuAnchor,
     },
@@ -957,6 +964,8 @@ impl WorkspaceAction {
             | CloseTabsRight(_)
             | CloseTabsRightActiveTab
             | CloseTabGroup(_)
+            | AttachHerdrDefault
+            | DetachHerdrSession
             | ToggleTabGroupCollapsed(_)
             | RenameTabGroup(_)
             | NewTabGroupFromTab(_)

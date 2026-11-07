@@ -339,6 +339,7 @@ use crate::env_vars::env_var_collection_block::{
 };
 use crate::env_vars::{CloudEnvVarCollection, EnvVar, EnvVarExt};
 use crate::features::FeatureFlag;
+use crate::herdr::protocol::AgentStatus;
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::{
@@ -384,7 +385,7 @@ use crate::settings_view::{SettingsSection, flags};
 use crate::shell_indicator::ShellIndicatorType;
 use crate::terminal::alias::{AliasedCommand, check_for_alias_async};
 use crate::terminal::alt_screen::alt_screen_element::AltScreenElement;
-use crate::terminal::alt_screen::should_intercept_scroll;
+use crate::terminal::alt_screen::{should_intercept_mouse, should_intercept_scroll};
 use crate::terminal::alt_screen_reporting::{AltScreenReporting, AltScreenReportingChangedEvent};
 use crate::terminal::block_filter::{
     BlockFilterEditor, BlockFilterEditorEvent, BlockFilterQuery, OpenedFromClick,
@@ -408,8 +409,8 @@ use crate::terminal::cli_agent_sessions::listener::{CLIAgentSessionListener, is_
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{PluginModalKind, plugin_manager_for};
 use crate::terminal::cli_agent_sessions::{
-    CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentRichInputCloseReason, CLIAgentSession,
-    CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
+    BlockedSource, CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentRichInputCloseReason,
+    CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
     CLIAgentSessionsModelEvent,
 };
 use crate::terminal::color::List;
@@ -452,7 +453,7 @@ use crate::terminal::model::escape_sequences::{
 };
 use crate::terminal::model::grid::grid_handler::{FragmentBoundary, TermMode};
 use crate::terminal::model::index::{Point, Side};
-use crate::terminal::model::mouse::MouseState;
+use crate::terminal::model::mouse::{MouseAction, MouseButton, MouseState};
 use crate::terminal::model::selection::{SelectAction, SelectionDirection};
 use crate::terminal::model::session::active_session::ActiveSession;
 use crate::terminal::model::session::{
@@ -512,7 +513,7 @@ use crate::terminal::warpify::SubshellSource;
 use crate::terminal::warpify::render::render_subshell_separator;
 use crate::terminal::warpify::settings::WarpifySettings;
 use crate::terminal::waterfall_gap_element::WaterfallGapElement;
-use crate::terminal::writeable_pty::{PtyIntent, PtyIntentEvent, TerminalSurface};
+use crate::terminal::writeable_pty::{PtyIntent, PtyIntentEvent, ScrollSource, TerminalSurface};
 use crate::terminal::{
     AudibleBell, BlockListSettings, BlockListSettingsChangedEvent, CellSizeAndWindowPadding,
     History, HistoryEntry, ShellHost, ShellLaunchData, SizeInfo, SizeUpdate, SizeUpdateReason,
@@ -1781,6 +1782,17 @@ pub enum Event {
     WriteBytesToPty {
         bytes: Cow<'static, [u8]>,
     },
+    /// Scroll a foreign-controlled (herdr-mirrored) pane: herdr owns the
+    /// scrollback — including pre-attach history the local grid never had —
+    /// so scroll gestures forward as `terminal.scroll` instead of scrolling
+    /// the local grid.
+    ScrollForeignPty {
+        up: bool,
+        lines: u32,
+        source: ScrollSource,
+    },
+    MouseForeignPty(MouseState),
+    RetakeHerdrControl,
     WriteAgentInputToPty {
         bytes: Cow<'static, [u8]>,
         mode: AIAgentPtyWriteMode,
@@ -2519,6 +2531,10 @@ struct LocalSessionCanonicalPwdCache {
 
 pub struct TerminalView {
     pub model: Arc<FairMutex<TerminalModel>>,
+    /// Whether this pane is controlled by a foreign herdr client. This bit is set on the model
+    /// before view construction and is immutable for the lifetime of the pane.
+    foreign_controlled: bool,
+    herdr_control_banner: Option<ViewHandle<Banner<()>>>,
     view_handle: WeakViewHandle<Self>,
 
     /// The session's size data. This is wrapped in a [`Tracked`] to
@@ -4375,8 +4391,27 @@ impl TerminalView {
         });
 
         let window_id = ctx.window_id();
+        let foreign_controlled = model.lock().is_foreign_controlled();
+        let herdr_control_banner = foreign_controlled.then(|| {
+            ctx.add_typed_action_view(|_| {
+                Banner::new_with_buttons(
+                    BannerTextContent::plain_text(
+                        "Another client took control of this terminal. This view is paused.",
+                    ),
+                    vec![BannerTextButton::new(
+                        "Reconnect here".to_string(),
+                        Rc::new(|ctx, _, _| {
+                            ctx.dispatch_typed_action(TerminalAction::RetakeHerdrControl);
+                        }),
+                    )],
+                    false,
+                )
+            })
+        });
         let mut terminal_view = Self {
             model,
+            foreign_controlled,
+            herdr_control_banner,
             input,
             inline_menu_positioner,
             view_handle: ctx.handle(),
@@ -10103,7 +10138,32 @@ impl TerminalView {
 
     /// Forwards wheel movement on the alt screen to the PTY, as SGR mouse
     /// reports when the app requested them and arrow keys otherwise.
-    fn alt_scroll(&mut self, lines_to_scroll: i32, point: Point, ctx: &mut ViewContext<Self>) {
+    fn alt_scroll(
+        &mut self,
+        lines_to_scroll: i32,
+        point: Point,
+        modifiers: ModifiersState,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // A mirrored pane's wheel scroll goes to herdr instead: herdr owns
+        // the scrollback and routes wheel scrolls to the inner program when
+        // it requested mouse reporting, so the local encoding — and the
+        // local grid — never come into play.
+        if self.foreign_controlled {
+            if lines_to_scroll != 0 && !self.is_read_only() {
+                ctx.emit(Event::MouseForeignPty(
+                    MouseState::new(
+                        MouseButton::Wheel,
+                        MouseAction::Scrolled {
+                            delta: lines_to_scroll,
+                        },
+                        modifiers,
+                    )
+                    .set_point(point),
+                ));
+            }
+            return;
+        }
         let report_mouse = !should_intercept_scroll(&self.model.lock(), ctx);
         if !report_mouse {
             // Arrow-key scrolling can change the alt-screen grid content, so
@@ -10119,6 +10179,29 @@ impl TerminalView {
             self.write_user_bytes_to_pty(bytes, ctx);
             ctx.notify();
         }
+    }
+
+    /// Forwards a scroll gesture to herdr when this pane is
+    /// foreign-controlled, returning whether the gesture was handled.
+    /// herdr owns the mirrored pane's scrollback — the local grid only has
+    /// frames since attach — so the gesture must not also scroll the local
+    /// grid. A zero-line gesture is still "handled" (there is nothing to
+    /// send, and herdr rejects 0 lines).
+    fn forward_scroll_to_herdr(
+        &mut self,
+        up: bool,
+        lines: u32,
+        source: ScrollSource,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        if !self.foreign_controlled {
+            return false;
+        }
+        if lines > 0 {
+            log::trace!("herdr: forwarding scroll up={up} lines={lines} source={source:?}");
+            ctx.emit(Event::ScrollForeignPty { up, lines, source });
+        }
+        true
     }
 
     pub fn input_size_at_last_frame(&self, app: &AppContext) -> Option<Vector2F> {
@@ -14285,7 +14368,14 @@ impl TerminalView {
     /// If the startup auto-open setting is enabled, auto-opens rich input for a
     /// CLI agent session. Called after creating a command-detected session or
     /// registering a listener so rich input is shown immediately.
+    ///
+    /// Only when this view holds keyboard focus: sessions can be seeded for
+    /// views the user is not in (herdr panes in inactive tabs, agents
+    /// starting in background tabs), and opening would steal focus there.
     fn maybe_auto_open_cli_agent_rich_input(&mut self, ctx: &mut ViewContext<Self>) {
+        if !ctx.is_self_or_child_focused() {
+            return;
+        }
         let ai_settings = AISettings::as_ref(ctx);
         if !*ai_settings.auto_open_rich_input_on_cli_agent_start
             || !ai_settings.is_any_ai_enabled(ctx)
@@ -14300,6 +14390,161 @@ impl TerminalView {
         if should_open && !self.has_active_cli_agent_input_session(ctx) {
             self.open_cli_agent_rich_input(CLIAgentInputEntrypoint::AutoShow, ctx);
         }
+    }
+
+    /// Syncs the CLI agent session with the agent herdr reports running in a
+    /// mirrored pane. Foreign-controlled panes never emit the shell-integration
+    /// hooks that drive local command detection, and the simulated startup
+    /// preexec fires before the view exists, so without this no session is ever
+    /// created for herdr panes — leaving the CLI agent footer hidden and the
+    /// Ctrl-G rich input binding unmatched, which sends the keystroke to the
+    /// agent as raw input (e.g. vim input in Claude Code).
+    ///
+    /// `agent` is the command name herdr reports (`Some("claude")`), or `None`
+    /// when no agent is running; `seed_status` is the pane's herdr-reported
+    /// agent status, used only as a NEW session's initial status (an existing
+    /// session's status is never touched — live transitions arrive via
+    /// [`Self::sync_herdr_cli_agent_session_status`]). Plugin-backed (OSC 777)
+    /// sessions own a listener and always take precedence over herdr's
+    /// report: neither an agent change nor `None` replaces or removes them. Otherwise a change
+    /// in agent replaces the session, and `None` removes ANY listener-less
+    /// session — not just one seeded by this path (command-detected local
+    /// sessions are listener-less too). An unrecognized foreground agent is
+    /// indistinguishable from `None` (`CLIAgent::detect` returns `None`), so
+    /// it removes a listener-less session as well.
+    pub(crate) fn sync_herdr_cli_agent_session(
+        &mut self,
+        agent: Option<&str>,
+        seed_status: AgentStatus,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // herdr reports the agent as the command it observed, which can be a
+        // full path (/opt/homebrew/bin/claude); detection matches bare
+        // command names, so reduce to the basename first.
+        let cli_agent = agent
+            .map(|agent| {
+                std::path::Path::new(agent)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| agent.to_string())
+            })
+            .and_then(|agent| CLIAgent::detect(&agent, None, None, ctx));
+        let current = CLIAgentSessionsModel::as_ref(ctx).session(self.view_id);
+        match cli_agent {
+            // Keep the current session when it already matches the reported
+            // agent, or when it is plugin-backed: a listener-owning session
+            // wins over herdr's report.
+            Some(agent) if current.is_some_and(|s| s.agent == agent || s.listener.is_some()) => {}
+            Some(agent) => {
+                let should_auto_toggle_input =
+                    *AISettings::as_ref(ctx).auto_open_rich_input_on_cli_agent_start;
+                // herdr's status is seen-aware (finished-unseen = Done), so
+                // trust it. Idle seeds Success: no idle-at-prompt state
+                // exists, and a check mark beats a false "running" spinner.
+                let status = match seed_status {
+                    AgentStatus::Working | AgentStatus::Unknown => {
+                        CLIAgentSessionStatus::InProgress
+                    }
+                    AgentStatus::Blocked => CLIAgentSessionStatus::Blocked {
+                        message: None,
+                        source: BlockedSource::NeedsInput,
+                    },
+                    AgentStatus::Done | AgentStatus::Idle => CLIAgentSessionStatus::Success,
+                };
+                CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
+                    sessions_model.set_session(
+                        self.view_id,
+                        CLIAgentSession {
+                            agent,
+                            status,
+                            session_context: CLIAgentSessionContext::default(),
+                            input_state: CLIAgentInputState::Closed,
+                            should_auto_toggle_input,
+                            listener: None,
+                            plugin_version: None,
+                            remote_host: None,
+                            draft_text: None,
+                            custom_command_prefix: None,
+                            received_rich_notification: false,
+                        },
+                        ctx,
+                    );
+                });
+                self.maybe_auto_open_cli_agent_rich_input(ctx);
+            }
+            None if current.is_some_and(|s| s.listener.is_none()) => {
+                CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
+                    sessions_model.remove_session(self.view_id, ctx);
+                });
+            }
+            None => {}
+        }
+    }
+
+    /// Syncs the per-pane agent status herdr reports onto the seeded CLI agent
+    /// session, so mirrored panes surface live status (icon badge, footer,
+    /// blocked/completed notifications) like a locally-detected agent would.
+    /// Only herdr-seeded (listener-less) sessions are updated — plugin-backed
+    /// (OSC 777) sessions report their own richer status and always win,
+    /// mirroring `sync_herdr_cli_agent_session`'s preservation rule. No-op
+    /// when there is no session.
+    ///
+    /// Status mapping (herdr has no failure signal, and no status text):
+    /// - `Working` → `InProgress`, via a synthetic `PromptSubmit` event.
+    /// - `Blocked` → `Blocked { message: None }`, via `PermissionRequest`.
+    /// - `Done` → `Success`, via `Stop`.
+    /// - `Idle`/`Unknown` → no-op: like the plugin protocol's `IdlePrompt`,
+    ///   sitting at a prompt must not override the last real status, and an
+    ///   unrecognized status carries no signal.
+    ///
+    /// The status is applied through `update_from_event` (rather than
+    /// `set_session`) so the session is mutated in place: rich input stays
+    /// open, drafts survive, and subscribers observe a `StatusChanged` event.
+    /// The synthetic event pairs each status with the event type that
+    /// produces it in `apply_event`, and uses a non-`RichPlugin` source so
+    /// `received_rich_notification` is not latched — a herdr-seeded session
+    /// must not pose as plugin-backed.
+    pub(crate) fn sync_herdr_cli_agent_session_status(
+        &mut self,
+        status: AgentStatus,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let (new_status, event_type) = match status {
+            AgentStatus::Working => (
+                CLIAgentSessionStatus::InProgress,
+                CLIAgentEventType::PromptSubmit,
+            ),
+            AgentStatus::Blocked => (
+                CLIAgentSessionStatus::Blocked {
+                    message: None,
+                    source: BlockedSource::NeedsInput,
+                },
+                CLIAgentEventType::PermissionRequest,
+            ),
+            AgentStatus::Done => (CLIAgentSessionStatus::Success, CLIAgentEventType::Stop),
+            AgentStatus::Idle | AgentStatus::Unknown => return,
+        };
+        let Some(agent) = CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.view_id)
+            .filter(|session| session.listener.is_none() && session.status != new_status)
+            .map(|session| session.agent)
+        else {
+            return;
+        };
+        let event = CLIAgentEvent {
+            v: 1,
+            agent,
+            // Any non-RichPlugin source: the rich latch must stay unset.
+            source: CLIAgentEventSource::CodexOsc9Fallback,
+            event: event_type,
+            session_id: None,
+            cwd: None,
+            project: None,
+            payload: CLIAgentEventPayload::default(),
+        };
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
+            sessions_model.update_from_event(self.view_id, &event, ctx);
+        });
     }
 
     /// Handles CLI agent session status changes from the singleton model.
@@ -18954,6 +19199,18 @@ impl TerminalView {
     }
 
     fn alt_mouse_action(&mut self, mouse_state: &MouseState, ctx: &mut ViewContext<Self>) {
+        if self.foreign_controlled {
+            let forward = {
+                let model = self.model.lock();
+                !model.is_read_only()
+                    && !model.block_list().active_block().is_agent_in_control()
+                    && !should_intercept_mouse(&model, mouse_state.modifiers().shift, ctx)
+            };
+            if forward {
+                ctx.emit(Event::MouseForeignPty(*mouse_state));
+            }
+            return;
+        }
         let escape_sequences = mouse_state
             .to_escape_sequence(self.model.lock().deref())
             .unwrap();
@@ -23867,6 +24124,14 @@ impl TerminalView {
     }
 
     fn page_up(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.forward_scroll_to_herdr(
+            true,
+            self.size_info.rows as u32,
+            ScrollSource::PageKey,
+            ctx,
+        ) {
+            return;
+        }
         if self.is_long_running() {
             // Note: We explicitly use the CSI prefix, as the terminal we are impersonating
             // (`xterm-256color`) has the escape sequence for page up defined with that prefix
@@ -23878,6 +24143,14 @@ impl TerminalView {
     }
 
     fn page_down(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.forward_scroll_to_herdr(
+            false,
+            self.size_info.rows as u32,
+            ScrollSource::PageKey,
+            ctx,
+        ) {
+            return;
+        }
         if self.is_long_running() {
             // Note: We explicitly use the CSI prefix, as the terminal we are impersonating
             // (`xterm-256color`) has the escape sequence for page down defined with that prefix
@@ -24652,6 +24925,25 @@ impl TerminalView {
             .as_ref()
             .and_then(BlockMetadata::current_working_directory)
             .map(|pwd| pwd.to_string())
+    }
+
+    /// For foreign-controlled panes (herdr control mode), the CLI agent the
+    /// controller reports running in the pane. Foreign agents never emit
+    /// Warp's agent-integration events, so the controller's report (updated
+    /// live as agents start and stop) is the only signal for icons/badges.
+    pub fn foreign_controlled_cli_agent(&self, ctx: &AppContext) -> Option<CLIAgent> {
+        if !self.foreign_controlled {
+            return None;
+        }
+        // Copy the command out and drop the lock before detecting: this runs
+        // per-render from sidebar call sites, so the model must not stay
+        // locked across `CLIAgent::detect`.
+        let command = self.model.lock().foreign_agent()?.to_owned();
+        CLIAgent::detect(&command, None, None, ctx)
+    }
+
+    pub(crate) fn is_foreign_controlled(&self) -> bool {
+        self.foreign_controlled
     }
 
     pub fn pwd_if_local(&self, ctx: &AppContext) -> Option<String> {
@@ -27360,6 +27652,12 @@ impl PtyIntentEvent for Event {
             Event::CtrlD => Some(PtyIntent::CtrlD),
             Event::ShutdownPty => Some(PtyIntent::ShutdownPty),
             Event::WriteBytesToPty { bytes } => Some(PtyIntent::WriteBytes(bytes.clone())),
+            Event::MouseForeignPty(state) => Some(PtyIntent::Mouse(*state)),
+            Event::ScrollForeignPty { up, lines, source } => Some(PtyIntent::Scroll {
+                up: *up,
+                lines: *lines,
+                source: *source,
+            }),
             Event::WriteAgentInputToPty { bytes, mode } => Some(PtyIntent::WriteAgentInput {
                 bytes: bytes.clone(),
                 mode: *mode,
@@ -27922,6 +28220,7 @@ impl TypedActionView for TerminalView {
             | CycleNextOrchestrationChildAgent
             | ToggleCLIAgentRichInput
             | ToggleSessionRecording
+            | RetakeHerdrControl
             | Osc52AllowBlockedClipboardOperation => Empty,
         }
     }
@@ -27931,8 +28230,17 @@ impl TypedActionView for TerminalView {
         let input_mode = *InputModeSettings::as_ref(ctx).input_mode.value();
 
         match action {
+            RetakeHerdrControl => {
+                if self.model.lock().foreign_control_released() {
+                    ctx.emit(Event::RetakeHerdrControl);
+                }
+            }
             Scroll { delta } => self.scroll(*delta, ctx),
-            AltScroll { delta, point } => self.alt_scroll(*delta, *point, ctx),
+            AltScroll {
+                delta,
+                point,
+                modifiers,
+            } => self.alt_scroll(*delta, *point, *modifiers, ctx),
             SharedSessionViewerAltScroll { new_scroll_top } => {
                 self.alt_screen_scroll_top = *new_scroll_top;
                 ctx.notify()
@@ -29185,6 +29493,11 @@ impl View for TerminalView {
                         self.render_block_list_element(&model, input_mode, true, app)
                     };
 
+                    if model.foreign_control_released()
+                        && let Some(banner) = &self.herdr_control_banner
+                    {
+                        column.add_child(ChildView::new(banner).finish());
+                    }
                     column.add_child(Shrinkable::new(1., output_area).finish());
 
                     // Suppress the "Use agent" footer when the nested program is

@@ -46,6 +46,7 @@ use crate::terminal::view::TerminalViewState;
 use crate::themes::theme::{AnsiColorIdentifier, Fill as ThemeFill, VerticalGradient};
 use crate::ui_components::buttons::icon_button;
 use crate::ui_components::color_dot::{TAB_COLOR_OPTIONS, render_color_dot};
+use crate::ui_components::herdr_badge::render_herdr_badge;
 use crate::ui_components::icons::{ICON_DIMENSIONS, Icon};
 use crate::util::bindings::{keybinding_name_to_display_string, keybinding_name_to_keystroke};
 use crate::util::color::{Opacity, coloru_with_opacity};
@@ -370,6 +371,18 @@ pub struct TabData {
     pub in_multi_selection: bool,
     /// True when this tab is pinned to the front of the tab list.
     pub pinned: bool,
+    /// Set when this tab mirrors a herdr tab (herdr control mode); value is
+    /// the herdr tab id, e.g. "w1:t2". Herdr-bound tabs are not persisted.
+    pub herdr_tab: Option<String>,
+    /// The herdr workspace owning `herdr_tab`, stamped and cleared together
+    /// with it. Stored explicitly (from `TabInfo::workspace_id`) so nothing
+    /// has to parse a workspace out of the tab id — the id's format is
+    /// herdr's business.
+    pub herdr_workspace: Option<String>,
+    /// Live herdr agent-status color (Working→Blue, Blocked→Red, Done→Green;
+    /// None when idle/unknown). Transient: layered above `selected_color` at
+    /// render time without ever overwriting the user's choice.
+    pub herdr_status_color: Option<AnsiColorIdentifier>,
 }
 
 const TAB_COLOR_ICON_PATH: &str = "bundled/svg/ellipse.svg";
@@ -390,11 +403,22 @@ impl TabData {
             group_id: None,
             in_multi_selection: false,
             pinned: false,
+            herdr_tab: None,
+            herdr_workspace: None,
+            herdr_status_color: None,
         }
     }
 
-    /// The resolved tab color: manual selection takes priority over directory default.
+    /// The rendered tab color: a transient herdr agent-status color layers
+    /// above the user's selection.
     pub fn color(&self) -> Option<AnsiColorIdentifier> {
+        self.herdr_status_color.or_else(|| self.user_color())
+    }
+
+    /// The user's color selection (manual choice over directory default),
+    /// ignoring any transient herdr status overlay — what the color menu and
+    /// toggle logic compare against.
+    pub fn user_color(&self) -> Option<AnsiColorIdentifier> {
         self.selected_color.resolve(self.default_directory_color)
     }
 
@@ -881,7 +905,7 @@ impl TabData {
     ) -> Vec<MenuItem<WorkspaceAction>> {
         if FeatureFlag::DirectoryTabColors.is_enabled() {
             color_picker_menu_items(
-                self.color(),
+                self.user_color(),
                 terminal_colors,
                 ColorPickerTarget::Tab { tab_index: index },
             )
@@ -902,7 +926,7 @@ impl TabData {
                 .map(|color_option| {
                     let color = color_option.to_ansi_color(&terminal_colors);
                     MenuItemFields::new_with_icon(
-                        if self.color() == Some(*color_option) {
+                        if self.user_color() == Some(*color_option) {
                             TAB_NO_COLOR_ICON_PATH
                         } else {
                             TAB_COLOR_ICON_PATH
@@ -1502,7 +1526,7 @@ impl<'a> TabComponent<'a> {
             )
             .finish()
         } else {
-            Text::new_inline(
+            let title = Text::new_inline(
                 self.title.clone(),
                 self.styles
                     .default
@@ -1517,7 +1541,23 @@ impl<'a> TabComponent<'a> {
             })
             .with_style(font_style)
             .with_color(font_color)
-            .finish()
+            .finish();
+            // Herdr-bound tabs carry a passive "herdr" chip after the title
+            // (the title clips before the chip when space runs out); local
+            // tabs render the bare title exactly as before.
+            if self.tab.herdr_tab.is_some() {
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(Shrinkable::new(1., title).finish())
+                    .with_child(
+                        Container::new(render_herdr_badge(self.appearance))
+                            .with_margin_left(4.)
+                            .finish(),
+                    )
+                    .finish()
+            } else {
+                title
+            }
         }
     }
 
