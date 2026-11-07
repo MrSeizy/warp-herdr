@@ -27,15 +27,9 @@ fn local_child_harnesses_are_local_only_by_default() {
     assert!(!DOGFOOD_FLAGS.contains(&FeatureFlag::LocalClaudeCodexChildHarnesses));
 }
 
-/// Herdr control mode is dogfood-gated, but its development loop runs on the
-/// OSS/local binary (script/run without warp-channel-config), where dogfood
-/// flags are off. The Debug menu's runtime toggle is the sanctioned way to
-/// exercise it there — dropping it from this list silently hides the
-/// attach/detach commands from every dev build.
 #[test]
-fn herdr_control_mode_is_runtime_toggleable_for_dev_builds() {
+fn herdr_control_mode_remains_runtime_toggleable() {
     assert!(RUNTIME_FEATURE_FLAGS.contains(&FeatureFlag::HerdrControlMode));
-    assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::HerdrControlMode));
 }
 
 #[test]

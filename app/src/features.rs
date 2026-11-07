@@ -461,6 +461,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::TabConfigs,
         #[cfg(feature = "grouped_tabs")]
         FeatureFlag::GroupedTabs,
+        #[cfg(feature = "herdr_control_mode")]
+        FeatureFlag::HerdrControlMode,
         #[cfg(feature = "pinned_tabs")]
         FeatureFlag::PinnedTabs,
         #[cfg(feature = "warp_control_cli")]
@@ -545,3 +547,7 @@ fn enabled_features() -> HashSet<FeatureFlag> {
 
     flags
 }
+
+#[cfg(all(test, feature = "herdr_control_mode"))]
+#[path = "features_tests.rs"]
+mod tests;

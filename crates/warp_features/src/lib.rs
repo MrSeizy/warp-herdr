@@ -1083,7 +1083,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::McpJsonTreeView,
     FeatureFlag::BoxDrawingGlyphs,
     FeatureFlag::AccountFirstOnboarding,
-    FeatureFlag::HerdrControlMode,
     FeatureFlag::CtrlCCancelsThirdPartyHarness,
     FeatureFlag::WarpingModelName,
     FeatureFlag::LrcActivitySignal,
@@ -1120,9 +1119,6 @@ pub const RELEASE_FLAGS: &[FeatureFlag] = &[
 /// Flags that we want to allow to switch at runtime (assuming RuntimeFeatureFlags is set)
 pub const RUNTIME_FEATURE_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::LocalClaudeCodexChildHarnesses,
-    // Dogfood-gated, but its development loop runs on the OSS/local binary
-    // where dogfood flags are off; the Debug-menu toggle is how dev builds
-    // exercise it (the palette attach/detach commands gate on it).
     FeatureFlag::HerdrControlMode,
 ];
 
